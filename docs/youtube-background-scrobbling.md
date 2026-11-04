@@ -48,7 +48,7 @@ other stores can use different IDs.
 2. Run `npm ci`, then `npm run dist chrome` from the source directory.
 3. On the browser's Extensions page, use **Load unpacked** and select
    `build/chrome`, the folder containing the generated `manifest.json`.
-4. Confirm that the loaded extension reports version **3.23.2** and the ID above.
+4. Confirm that the loaded extension reports version **3.23.3** and the ID above.
    Check that the original settings and scrobble cache are visible.
 5. Refresh any YouTube tabs that were open during the update so they use the
    updated content script.
@@ -61,11 +61,63 @@ field is a public identity key, not a private key. See Chrome's documentation on
 
 The message **A private key for specified extension already exists** means the
 packager is trying to create a signing-key file where one already exists. Keep
-the existing key file and use **Load unpacked** for this local build.
+the existing `.pem` file and select it in the packager's **Private key file**
+field when packing `build/chrome` again.
 
 Packing a CRX requires a private signing key. A newly generated key does not
 provide the signing identity of the published extension; the public key in the
 manifest does not let a local build sign official store updates.
+
+After installing a packed CRX, the browser keeps its own copy of the extension,
+so the unpacked build folder is no longer needed for that installation. Keep the
+CRX for installation and keep the `.pem` private and backed up for signing future
+updates. An unpacked installation still needs its build folder.
+
+## Console messages in 3.23.3
+
+Repeated **Cannot find menu item with id** errors mean that a menu update reached
+the browser before that menu existed. Version 3.23.3 waits for menu creation to
+finish before sending updates. Startup and simultaneous tab events share one
+initialization, and a restarted service worker recreates persisted menu IDs
+without duplicate creation. Menu failures are handled and reported without
+preventing the extension icon and title from updating.
+
+**ListenBrainz: no data** followed by **No data in storage** can occur when the
+Accounts page checks a ListenBrainz account that has never been connected.
+An absent account record is now treated as signed out without error logging or
+unnecessary sign-out writes. This does not sign the account in or restore data
+from another extension ID. Actual storage failures still propagate.
+
+For a packed 3.23.2 installation, create the 3.23.3 CRX with the same private
+signing key and install it as an update. Its ID must match the installed packed
+copy. The original store ID and the locally signed CRX ID can differ, as described
+above; do not generate a new key for a routine update.
+
+### Origin-check messages on YouTube
+
+Opera can report **Unsafe attempt to load URL** followed by **Domains, protocols
+and ports must match** for `connectors/youtube.js` or `icons/icon_main_48.png`.
+These messages alone do not establish that the connector failed or that a
+scrobble was lost.
+
+In an isolated Opera check of version 3.23.3 on a YouTube watch page, both
+resources returned HTTP 200. The YouTube connector executed in the extension's
+isolated context, and the icon loaded at 48 by 48 pixels. Separate page requests
+also succeeded, while Opera still logged the origin-check messages. The installed
+manifest already declared both paths as web-accessible resources; see
+[Chrome's resource documentation][WebAccessibleResources].
+
+The cause of the extra messages remains unconfirmed. Version 3.23.3 fixes the
+menu and ListenBrainz messages described above; it does not include a fix for
+these origin-check messages. This resource-loading check did not submit a live
+Last.fm scrobble.
+
+If these messages accompany missing scrobbles, check for an actual failed request
+in the page's Network panel and confirm whether the extension reaches its
+scrobbled indicator. Verify that Last.fm retains the play in listening history
+after **Scrobbling now** ends. A failed connector request or missing saved play
+needs further investigation, even if similar console messages previously
+appeared alongside successful resource loading.
 
 ## Verification
 
@@ -83,6 +135,12 @@ temporary blocks clearing before and after the threshold, recovery on resume,
 existing restrictions, manual recovery, duplicate playback updates, and the
 Chromium extension ID derived from the public key.
 
+Additional tests cover asynchronous menu creation, simultaneous startup and tab
+updates, worker restarts, menu API failures, and unconfigured ListenBrainz
+accounts. A fresh, isolated Opera profile was also used to load the 3.23.3
+Accounts page and update all five menu IDs; none of the reported console errors
+occurred in that check.
+
 For a browser check, open a YouTube music video paused in a background tab and
 leave it there longer than the normal scrobbling threshold. Activate the tab
 and start playback. The extension should wait for the required listening time,
@@ -96,3 +154,4 @@ they do not submit test plays to a live Last.fm account.
 
 [ManifestKey]: https://developer.chrome.com/docs/extensions/reference/manifest/key
 [LoadUnpacked]: https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#load-unpacked
+[WebAccessibleResources]: https://developer.chrome.com/docs/extensions/reference/manifest/web-accessible-resources

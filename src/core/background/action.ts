@@ -1,6 +1,5 @@
 import browser from 'webextension-polyfill';
 import {
-	contextMenus,
 	getBrowserPreferredTheme,
 	getChannelDetails,
 	getChannelBlocklistLabel,
@@ -11,6 +10,7 @@ import * as ControllerMode from '@/core/object/controller/controller-mode';
 import { getConnectorByUrl } from '@/util/util-connector';
 import { t } from '@/util/i18n';
 import ClonedSong from '@/core/object/cloned-song';
+import { contextMenus, ensureContextMenus } from './context-menus';
 
 /**
  * Updates action state using information from a tab
@@ -25,8 +25,12 @@ export async function performUpdateAction(tab: ManagerTab) {
 		console.warn(err);
 	});
 
-	await updateMenus(tab);
-	setAction(tab);
+	await Promise.all([
+		updateMenus(tab).catch((error: unknown) => {
+			console.warn('Unable to update extension context menus', error);
+		}),
+		setAction(tab),
+	]);
 }
 
 /**
@@ -35,93 +39,57 @@ export async function performUpdateAction(tab: ManagerTab) {
  * @param tab - tab to base update of context menus on
  */
 async function updateMenus(tab: ManagerTab): Promise<void> {
-	if (tab.mode === ControllerMode.Unsupported) {
-		browser.contextMenus?.update(contextMenus.ENABLE_CONNECTOR, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.DISABLE_CONNECTOR, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.DISABLE_UNTIL_CLOSED, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.DISABLE_CHANNEL, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.ENABLE_CHANNEL, {
-			visible: false,
-		});
+	const menus = browser.contextMenus;
+	if (!menus) {
 		return;
 	}
+	await ensureContextMenus();
 
-	const tabData = await browser.tabs.get(tab.tabId);
-	const connector = await getConnectorByUrl(tabData.url ?? '');
-	if (tab.mode === ControllerMode.Disabled) {
-		browser.contextMenus?.update(contextMenus.ENABLE_CONNECTOR, {
-			visible: true,
-			title: t('menuEnableConnector', connector?.label),
-		});
-		browser.contextMenus?.update(contextMenus.DISABLE_CONNECTOR, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.DISABLE_UNTIL_CLOSED, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.DISABLE_CHANNEL, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.ENABLE_CHANNEL, {
-			visible: false,
-		});
-		return;
+	const updates: Record<string, browser.Menus.UpdateUpdatePropertiesType> =
+		Object.fromEntries(
+			Object.values(contextMenus).map((id) => [id, { visible: false }]),
+		);
+	if (tab.mode !== ControllerMode.Unsupported) {
+		const tabData = await browser.tabs.get(tab.tabId);
+		const connector = await getConnectorByUrl(tabData.url ?? '');
+		if (tab.mode === ControllerMode.Disabled) {
+			updates[contextMenus.ENABLE_CONNECTOR] = {
+				visible: true,
+				title: t('menuEnableConnector', connector?.label),
+			};
+		} else {
+			updates[contextMenus.DISABLE_CONNECTOR] = {
+				visible: true,
+				title: t('menuDisableConnector', connector?.label),
+			};
+			updates[contextMenus.DISABLE_UNTIL_CLOSED] = {
+				visible: true,
+				title: t('menuDisableUntilTabClosed', connector?.label),
+			};
+			const channelDetails = await getChannelDetails(tab.tabId);
+			if (channelDetails?.channelInfo?.id && channelDetails.connector) {
+				const isBlocked = await getChannelBlocklistLabel(
+					channelDetails.channelInfo.id,
+					channelDetails.connector,
+				);
+				const id = isBlocked
+					? contextMenus.ENABLE_CHANNEL
+					: contextMenus.DISABLE_CHANNEL;
+				updates[id] = {
+					visible: true,
+					title: t(
+						isBlocked ? 'menuEnableChannel' : 'menuDisableChannel',
+						channelDetails.channelInfo.label,
+					),
+				};
+			}
+		}
 	}
-
-	browser.contextMenus?.update(contextMenus.ENABLE_CONNECTOR, {
-		visible: false,
-	});
-	browser.contextMenus?.update(contextMenus.DISABLE_CONNECTOR, {
-		visible: true,
-		title: t('menuDisableConnector', connector?.label),
-	});
-	browser.contextMenus?.update(contextMenus.DISABLE_UNTIL_CLOSED, {
-		visible: true,
-		title: t('menuDisableUntilTabClosed', connector?.label),
-	});
-
-	const channelDetails = await getChannelDetails(tab.tabId);
-	if (
-		!channelDetails ||
-		!channelDetails.channelInfo?.id ||
-		!channelDetails.connector
-	) {
-		browser.contextMenus?.update(contextMenus.DISABLE_CHANNEL, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.ENABLE_CHANNEL, {
-			visible: false,
-		});
-	} else if (
-		await getChannelBlocklistLabel(
-			channelDetails.channelInfo.id,
-			channelDetails.connector,
-		)
-	) {
-		browser.contextMenus?.update(contextMenus.DISABLE_CHANNEL, {
-			visible: false,
-		});
-		browser.contextMenus?.update(contextMenus.ENABLE_CHANNEL, {
-			visible: true,
-			title: t('menuEnableChannel', channelDetails.channelInfo.label),
-		});
-	} else {
-		browser.contextMenus?.update(contextMenus.DISABLE_CHANNEL, {
-			visible: true,
-			title: t('menuDisableChannel', channelDetails.channelInfo.label),
-		});
-		browser.contextMenus?.update(contextMenus.ENABLE_CHANNEL, {
-			visible: false,
-		});
-	}
+	await Promise.all(
+		Object.entries(updates).map(([id, properties]) =>
+			menus.update(id, properties),
+		),
+	);
 }
 
 /**
@@ -156,17 +124,19 @@ async function setAction(tab: ManagerTab): Promise<void> {
 	const iconPath = (resolution: number) =>
 		`icons/action_${tab.mode.toLowerCase()}_${resolution}_${iconType}.png`;
 
-	browser.action.setIcon({
-		path: {
-			16: getIconURL(iconPath(16)),
-			19: getIconURL(iconPath(19)),
-			32: getIconURL(iconPath(32)),
-			38: getIconURL(iconPath(38)),
-		},
-	});
-	browser.action.setTitle({
-		title: t(`pageAction${tab.mode}`, songstr),
-	});
+	await Promise.all([
+		browser.action.setIcon({
+			path: {
+				16: getIconURL(iconPath(16)),
+				19: getIconURL(iconPath(19)),
+				32: getIconURL(iconPath(32)),
+				38: getIconURL(iconPath(38)),
+			},
+		}),
+		browser.action.setTitle({
+			title: t(`pageAction${tab.mode}`, songstr),
+		}),
+	]);
 }
 
 /**

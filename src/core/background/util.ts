@@ -10,14 +10,6 @@ import type { ConnectorMeta } from '../connectors';
 const state = BrowserStorage.getStorage(BrowserStorage.STATE_MANAGEMENT);
 const blocklistStorage = BrowserStorage.getStorage(BrowserStorage.BLOCKLISTS);
 
-export const contextMenus = {
-	ENABLE_CONNECTOR: 'enableConnector',
-	DISABLE_CONNECTOR: 'disableConnector',
-	DISABLE_UNTIL_CLOSED: 'disableUntilClosed',
-	ENABLE_CHANNEL: 'enableChannel',
-	DISABLE_CHANNEL: 'disableChannel',
-};
-
 /**
  * Filters asynchronously. Parallelized.
  *

@@ -95,6 +95,13 @@ as disallowed scrobbles after playback starts. Playback timing now follows the
 video element, and eligible plays recover after a temporary block clears. See
 the [troubleshooting and verification notes](docs/youtube-background-scrobbling.md).
 
+Version 3.23.3 also fixes missing context menu errors during installation and
+worker startup, and avoids logging an unconfigured ListenBrainz account as a
+storage error. See the [console-message notes](docs/youtube-background-scrobbling.md#console-messages-in-3233).
+
+The notes also cover Opera's [YouTube origin-check messages](docs/youtube-background-scrobbling.md#origin-check-messages-on-youtube),
+which appeared in testing even when the connector and icon loaded successfully.
+
 ### Develop connectors
 
 Check the [wiki page][WikiDev] to understand development of connectors. Please
