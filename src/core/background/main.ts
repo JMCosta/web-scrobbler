@@ -9,7 +9,6 @@ import {
 import browser from 'webextension-polyfill';
 import {
 	DEFAULT_STATE,
-	contextMenus,
 	getState,
 	filterInactiveTabs,
 	setState,
@@ -24,6 +23,7 @@ import {
 	removeFromBlocklist,
 } from './util';
 import { performUpdateAction } from './action';
+import { contextMenus, ensureContextMenus } from './context-menus';
 import type { ControllerModeStr } from '@/core/object/controller/controller';
 import { isPrioritizedMode } from '@/core/object/controller/controller';
 import type { CloneableSong } from '@/core/object/song';
@@ -579,39 +579,8 @@ function onStartup() {
 		}
 	});
 
-	browser.contextMenus?.create({
-		id: contextMenus.ENABLE_CONNECTOR,
-		visible: false,
-		contexts: ['action'],
-		title: 'Error: You should not be seeing this',
-	});
-
-	browser.contextMenus?.create({
-		id: contextMenus.DISABLE_CONNECTOR,
-		visible: false,
-		contexts: ['action'],
-		title: 'Error: You should not be seeing this',
-	});
-
-	browser.contextMenus?.create({
-		id: contextMenus.DISABLE_UNTIL_CLOSED,
-		visible: false,
-		contexts: ['action'],
-		title: 'Error: You should not be seeing this',
-	});
-
-	browser.contextMenus.create({
-		id: contextMenus.ENABLE_CHANNEL,
-		visible: false,
-		contexts: ['action'],
-		title: 'Error: You should not be seeing this',
-	});
-
-	browser.contextMenus.create({
-		id: contextMenus.DISABLE_CHANNEL,
-		visible: false,
-		contexts: ['action'],
-		title: 'Error: You should not be seeing this',
+	void ensureContextMenus().catch((error: unknown) => {
+		console.warn('Unable to initialize extension context menus', error);
 	});
 }
 

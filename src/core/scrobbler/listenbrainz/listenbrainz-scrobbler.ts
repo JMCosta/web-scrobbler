@@ -108,8 +108,7 @@ export default class ListenBrainzScrobbler extends BaseScrobbler<'ListenBrainz'>
 
 		const data = await this.storage.get();
 		if (!data) {
-			this.debugLog('no data', 'error');
-			await this.signOut();
+			// An account that has not been connected has no stored session.
 			throw new Error(ServiceCallResult.ERROR_AUTH);
 		}
 
