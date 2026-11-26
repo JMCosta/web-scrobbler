@@ -154,6 +154,27 @@ describe('Controller playback and scrobble recovery', () => {
 		expect(scrobbleRequests()).toHaveLength(1);
 	});
 
+	it('updates the popup when a temporary block becomes a failed lookup', async () => {
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		expect(controller.getMode()).toBe(ControllerMode.Disallowed);
+		mocks.sendContentMessage.mockClear();
+
+		await update({
+			scrobblingDisallowedReason: 'YouTubeMusicLookupFailed',
+		});
+		expect(mocks.sendContentMessage).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: 'songUpdate',
+				payload: expect.objectContaining({
+					parsed: expect.objectContaining({
+						scrobblingDisallowedReason: 'YouTubeMusicLookupFailed',
+					}),
+				}),
+			}),
+		);
+		expect(controller.getMode()).toBe(ControllerMode.Disallowed);
+	});
+
 	it('submits the missed scrobble when a temporary block clears after the threshold', async () => {
 		await update({ scrobblingDisallowedReason: 'IsLoading' });
 		await vi.advanceTimersByTimeAsync(60_000);

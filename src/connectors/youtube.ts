@@ -66,14 +66,21 @@ let getTrackInfoFromYtMusicEnabled = false;
 let currentVideoDescription: string | null = null;
 let artistTrackFromDescription: TrackInfoWithAlbum | null = null;
 
-const getTrackInfoFromYoutubeMusicCache: {
-	[videoId: string]: {
-		done?: boolean;
-		recognisedByYtMusic?: boolean;
-		videoId?: string | null;
-		currentTrackInfo?: { artist?: string; track?: string };
+type YouTubeMusicLookup =
+	| { status: 'loading' | 'unrecognized' | 'unavailable' }
+	| { status: 'recognized'; trackInfo?: ArtistTrackInfo };
+
+interface YouTubeMusicPlayerResponse {
+	videoDetails?: {
+		musicVideoType?: string;
+		author?: string;
+		title?: string;
 	};
-} = {};
+}
+
+const youtubeMusicCache = new Map<string, YouTubeMusicLookup>();
+const youtubeMusicRetryDelayMs = 2_000;
+const youtubeMusicTimeoutMs = 8_000;
 
 const trackInfoGetters: (() =>
 	| ArtistTrackInfo
@@ -125,11 +132,8 @@ Connector.getTrackInfo = () => {
 
 	if (getTrackInfoFromYtMusicEnabled) {
 		const videoId = getVideoId();
-		if (!getTrackInfoFromYoutubeMusicCache[videoId ?? '']) {
-			// start loading getTrackInfoFromYoutubeMusic
-			getTrackInfoFromYoutubeMusic();
-
-			// wait for getTrackInfoFromYoutubeMusic to finish
+		if (videoId && !youtubeMusicCache.has(videoId)) {
+			getYouTubeMusicLookup(videoId);
 			return trackInfo;
 		}
 	}
@@ -204,23 +208,13 @@ Connector.scrobblingDisallowedReason = () => {
 	}
 
 	if (scrobbleMusicRecognisedOnly) {
-		const videoId = getVideoId();
-		const ytMusicCache = getTrackInfoFromYoutubeMusicCache[videoId ?? ''];
-
-		if (!ytMusicCache) {
-			// start loading getTrackInfoFromYoutubeMusic
-			getTrackInfoFromYoutubeMusic();
-			return 'IsLoading';
-		}
-
-		if (!ytMusicCache.done) {
-			// not done loading yet
-			return 'IsLoading';
-		}
-
-		if (!ytMusicCache.recognisedByYtMusic) {
-			// not recognised!
-			return 'NotOnYouTubeMusic';
+		switch (getYouTubeMusicLookup(getVideoId()).status) {
+			case 'loading':
+				return 'IsLoading';
+			case 'unavailable':
+				return 'YouTubeMusicLookupFailed';
+			case 'unrecognized':
+				return 'NotOnYouTubeMusic';
 		}
 	}
 
@@ -406,41 +400,64 @@ function getTopicArtistTrackFromDescription() {
 	return artistTrackFromDescription;
 }
 
-function getTrackInfoFromYoutubeMusic():
-	| ArtistTrackInfo
-	| Record<string, never>
-	| undefined {
-	// if neither getTrackInfoFromYtMusicEnabled nor scrobbleMusicRecognisedOnly
-	// are enabled, there is no need to run this getter
-	if (!getTrackInfoFromYtMusicEnabled && !scrobbleMusicRecognisedOnly) {
-		return {};
+function getTrackInfoFromYoutubeMusic(): ArtistTrackInfo | undefined {
+	if (!getTrackInfoFromYtMusicEnabled) {
+		return;
 	}
 
-	const videoId = getVideoId();
+	const result = getYouTubeMusicLookup(getVideoId());
+	return result.status === 'recognized' ? result.trackInfo : undefined;
+}
 
-	if (!getTrackInfoFromYoutubeMusicCache[videoId ?? '']) {
-		getTrackInfoFromYoutubeMusicCache[videoId ?? ''] = {
-			videoId: null,
-			done: false,
-			currentTrackInfo: {},
-		};
-	} else {
-		if (!getTrackInfoFromYtMusicEnabled) {
-			// this means that only scrobbleMusicRecognisedOnly is enabled,
-			// therefore only the cache is used and we return {} for the
-			// actual getter
-			return {};
-		}
-
-		if (getTrackInfoFromYoutubeMusicCache[videoId ?? ''].done) {
-			// already ran!
-			return getTrackInfoFromYoutubeMusicCache[videoId ?? '']
-				.currentTrackInfo;
-		}
-		// still running, lets be patient
-		return {};
+function getYouTubeMusicLookup(videoId: string | null): YouTubeMusicLookup {
+	const loading = { status: 'loading' } as const;
+	if (!videoId) {
+		return loading;
 	}
 
+	const cached = youtubeMusicCache.get(videoId);
+	if (cached) {
+		return cached;
+	}
+	youtubeMusicCache.set(videoId, loading);
+	void loadYouTubeMusicLookup(videoId, true);
+	return loading;
+}
+
+async function loadYouTubeMusicLookup(
+	videoId: string,
+	canRetry: boolean,
+): Promise<void> {
+	let result: YouTubeMusicLookup;
+	try {
+		result = await fetchYouTubeMusicLookup(videoId);
+	} catch (error) {
+		Util.debugLog(
+			`Failed to fetch youtube music data for ${videoId}: ${error}`,
+			'warn',
+		);
+		if (canRetry) {
+			setTimeout(() => {
+				if (getVideoId() === videoId) {
+					void loadYouTubeMusicLookup(videoId, false);
+				} else {
+					youtubeMusicCache.delete(videoId);
+				}
+			}, youtubeMusicRetryDelayMs);
+			return;
+		}
+		result = { status: 'unavailable' };
+	}
+
+	youtubeMusicCache.set(videoId, result);
+	if (getVideoId() === videoId) {
+		Connector.onStateChanged();
+	}
+}
+
+async function fetchYouTubeMusicLookup(
+	videoId: string,
+): Promise<YouTubeMusicLookup> {
 	const body = JSON.stringify({
 		context: {
 			client: {
@@ -455,51 +472,46 @@ function getTrackInfoFromYoutubeMusic():
 		videoId,
 	});
 
-	fetch('https://music.youtube.com/youtubei/v1/player', {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-		},
-		body,
-	})
-		.then((response) => response.json())
-		.then((videoInfo) => {
-			// TODO: type videoInfo
-			getTrackInfoFromYoutubeMusicCache[videoId ?? ''] = {
-				done: true,
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), youtubeMusicTimeoutMs);
+	try {
+		const response = await fetch(
+			'https://music.youtube.com/youtubei/v1/player',
+			{
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+				},
+				body,
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok) {
+			throw new Error(`YouTube Music returned HTTP ${response.status}`);
+		}
 
-				recognisedByYtMusic:
-					videoInfo.videoDetails?.musicVideoType?.startsWith(
-						'MUSIC_VIDEO_',
-					) || false,
-			};
-
-			// if videoDetails is not MUSIC_VIDEO_TYPE_OMV, it seems like it's
-			// not something youtube music actually knows, so it usually gives
-			// wrong results, so we only return if it is that musicVideoType
-			if (
-				videoInfo.videoDetails?.musicVideoType ===
-				'MUSIC_VIDEO_TYPE_OMV'
-			) {
-				getTrackInfoFromYoutubeMusicCache[
-					videoId ?? ''
-				].currentTrackInfo = {
-					artist: videoInfo.videoDetails.author,
-
-					track: videoInfo.videoDetails.title,
-				};
-			}
-		})
-		.catch((err) => {
-			Util.debugLog(
-				`Failed to fetch youtube music data for ${videoId}: ${err}`,
-				'warn',
-			);
-			getTrackInfoFromYoutubeMusicCache[videoId ?? ''] = {
-				done: true,
-				recognisedByYtMusic: false,
-			};
-		});
+		const { videoDetails } =
+			(await response.json()) as YouTubeMusicPlayerResponse;
+		if (!videoDetails) {
+			throw new Error('YouTube Music returned no video details');
+		}
+		if (!videoDetails.musicVideoType?.startsWith('MUSIC_VIDEO_')) {
+			return { status: 'unrecognized' };
+		}
+		// Other video types can be recognized as music without usable track metadata.
+		if (videoDetails.musicVideoType !== 'MUSIC_VIDEO_TYPE_OMV') {
+			return { status: 'recognized' };
+		}
+		return {
+			status: 'recognized',
+			trackInfo: {
+				artist: videoDetails.author,
+				track: videoDetails.title,
+			},
+		};
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 function getTrackInfoFromChapters() {

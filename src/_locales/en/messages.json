@@ -707,6 +707,10 @@
       "message": "YouTube Music does not recognize this video as music, and you have enabled the option \"Scrobble only videos that are recognized by YouTube Music as music\" in settings.",
       "description": "The description of 'disallowed' popup."
     },
+    "disallowedDescYouTubeMusicLookupFailed": {
+      "message": "Web Scrobbler could not check whether YouTube Music recognizes this video. Reload the page to try again.",
+      "description": "The description of 'disallowed' popup when the YouTube Music lookup fails."
+    },
     "disallowedDescIsPlayingElsewhere": {
       "message": "The reason is that Web Scrobbler thinks this track is playing elsewhere and should not be scrobbled.",
       "description": "The description of 'disallowed' popup."

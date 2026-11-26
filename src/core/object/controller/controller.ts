@@ -884,12 +884,23 @@ export default class Controller {
 		} = newState;
 		const isPlayingStateChanged =
 			this.currentSong.parsed.isPlaying !== isPlaying;
+		const disallowedReasonChanged =
+			this.currentSong.parsed.scrobblingDisallowedReason !==
+			scrobblingDisallowedReason;
 
 		this.currentSong.parsed.currentTime = currentTime;
 		this.currentSong.parsed.isPlaying = isPlaying;
 		this.currentSong.parsed.trackArt = trackArt;
 		this.currentSong.parsed.scrobblingDisallowedReason =
 			scrobblingDisallowedReason;
+
+		if (
+			this.mode === ControllerMode.Disallowed &&
+			scrobblingDisallowedReason &&
+			disallowedReasonChanged
+		) {
+			this.onSongUpdated();
+		}
 
 		if (this.isNeedToUpdateDuration(newState) && duration) {
 			this.updateSongDuration(duration);

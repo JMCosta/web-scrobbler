@@ -29,6 +29,11 @@ export type DisallowedReason =
 	| 'NotOnYouTubeMusic'
 
 	/**
+	 * The YouTube Music lookup could not confirm whether the video is music.
+	 */
+	| 'YouTubeMusicLookupFailed'
+
+	/**
 	 * Web scrobbler thinks this song is playing on a different device
 	 */
 	| 'IsPlayingElsewhere'
