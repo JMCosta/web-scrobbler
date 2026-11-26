@@ -11,14 +11,17 @@ const mocks = vi.hoisted(() => ({
 	pushScrobble: vi.fn(),
 	deleteScrobbles: vi.fn(),
 	shouldScrobbleChannel: vi.fn(),
-	listeners: new Map<string, () => void>(),
+	listeners: new Map<string, (value?: boolean) => void>(),
 }));
 
 vi.mock('webextension-polyfill', () => ({ default: {} }));
 vi.mock('@/util/communication', () => ({
 	sendContentMessage: mocks.sendContentMessage,
 	setupContentListeners: vi.fn(),
-	contentListener: (listener: { type: string; fn: () => void }) => {
+	contentListener: (listener: {
+		type: string;
+		fn: (value?: boolean) => void;
+	}) => {
 		mocks.listeners.set(listener.type, listener.fn);
 		return listener;
 	},
@@ -254,5 +257,109 @@ describe('Controller playback and scrobble recovery', () => {
 		completeSubmission([[ServiceCallResult.RESULT_OK]]);
 		await vi.advanceTimersByTimeAsync(0);
 		expect(controller.getMode()).toBe(ControllerMode.Scrobbled);
+	});
+
+	it('retains a blocked play in the cache when the next video scrobbles', async () => {
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(mocks.pushScrobble).toHaveBeenCalledOnce();
+
+		await update({
+			track: 'Next track',
+			uniqueID: 'next-video',
+			scrobblingDisallowedReason: null,
+		});
+		await vi.advanceTimersByTimeAsync(60_000);
+
+		expect(scrobbleRequests()).toHaveLength(1);
+		expect(scrobbleRequests()[0][0].payload.songs[0].parsed.uniqueID).toBe(
+			'next-video',
+		);
+		expect(mocks.deleteScrobbles).not.toHaveBeenCalled();
+	});
+
+	it('does not mark the next video scrobbled when an earlier recovery succeeds', async () => {
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		await vi.advanceTimersByTimeAsync(60_000);
+
+		let completeSubmission!: (results: ServiceCallResult[][]) => void;
+		mocks.sendContentMessage.mockImplementation(async ({ type }) =>
+			type === 'scrobble'
+				? new Promise<ServiceCallResult[][]>((resolve) => {
+						completeSubmission = resolve;
+					})
+				: [ServiceCallResult.RESULT_OK],
+		);
+		await update({ scrobblingDisallowedReason: null });
+		expect(scrobbleRequests()).toHaveLength(1);
+		expect(mocks.deleteScrobbles).not.toHaveBeenCalled();
+
+		await update({ track: 'Next track', uniqueID: 'next-video' });
+		completeSubmission([[ServiceCallResult.RESULT_OK]]);
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(mocks.deleteScrobbles).toHaveBeenCalledExactlyOnceWith([1]);
+		expect(controller.getCurrentSong()?.flags.isScrobbled).toBe(false);
+		expect(controller.getMode()).toBe(ControllerMode.Playing);
+	});
+
+	it('does not transfer a delayed cache write to the next video', async () => {
+		let completeCacheWrite!: (id: number) => void;
+		mocks.pushScrobble.mockImplementationOnce(
+			() =>
+				new Promise<number>((resolve) => {
+					completeCacheWrite = resolve;
+				}),
+		);
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		await vi.advanceTimersByTimeAsync(60_000);
+
+		await update({
+			track: 'Next track',
+			uniqueID: 'next-video',
+			scrobblingDisallowedReason: null,
+		});
+		completeCacheWrite(1);
+		await update({ currentTime: 2 });
+		expect(scrobbleRequests()).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(scrobbleRequests()).toHaveLength(1);
+		expect(mocks.deleteScrobbles).not.toHaveBeenCalled();
+	});
+
+	it('submits the original play after editing ends on the next video', async () => {
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		await vi.advanceTimersByTimeAsync(60_000);
+		mocks.listeners.get('setEditState')!(true);
+		await update({ scrobblingDisallowedReason: null });
+		expect(scrobbleRequests()).toHaveLength(0);
+
+		await update({ track: 'Next track', uniqueID: 'next-video' });
+		mocks.listeners.get('setEditState')!(false);
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(scrobbleRequests()).toHaveLength(1);
+		const { songs, currentlyPlaying } = scrobbleRequests()[0][0].payload;
+		expect(songs[0].parsed.uniqueID).toBe('video');
+		expect(currentlyPlaying).toBe(false);
+		expect(controller.getCurrentSong()?.flags.isScrobbled).toBe(false);
+	});
+
+	it('keeps the recovery entry when the background cannot confirm submission', async () => {
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		await vi.advanceTimersByTimeAsync(60_000);
+		mocks.sendContentMessage.mockImplementation(async ({ type }) => {
+			if (type === 'scrobble') {
+				throw new Error('Message channel disconnected');
+			}
+			return [ServiceCallResult.RESULT_OK];
+		});
+
+		await update({ scrobblingDisallowedReason: null });
+
+		expect(scrobbleRequests()).toHaveLength(1);
+		expect(mocks.deleteScrobbles).not.toHaveBeenCalled();
+		expect(controller.getMode()).toBe(ControllerMode.Err);
 	});
 });
