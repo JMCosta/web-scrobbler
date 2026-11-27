@@ -33,7 +33,18 @@ import Blocklist from '@/core/storage/blocklist';
  * List of song fields used to check if song is changed. If any of
  * these fields are changed, the new song is playing.
  */
-const fieldsToCheckSongChange = ['artist', 'track', 'album', 'uniqueID'];
+const fieldsToCheckSongChange = [
+	'artist',
+	'track',
+	'album',
+	'uniqueID',
+] as const;
+const trackMetadataFields = [
+	'artist',
+	'track',
+	'album',
+	'albumArtist',
+] as const;
 
 export type ControllerEvent =
 	(typeof ControllerEvents)[keyof typeof ControllerEvents];
@@ -78,6 +89,7 @@ export default class Controller {
 	private replayDetectionTimer = new Timer();
 
 	private currentSong: Song | null = null;
+	private processingRun = 0;
 	private isReplayingSong = false;
 	private shouldScrobblePodcasts = true;
 	private scrobbleCacheIds = new WeakMap<Song, number>();
@@ -87,6 +99,7 @@ export default class Controller {
 	private forceScrobble = false;
 	private shouldHaveScrobbled = false;
 	private scrobblingSongs = new WeakSet<Song>();
+	private unconfirmedSubmissions = new WeakSet<Song>();
 
 	private isEditing = false;
 	private setNotEditingTimeout = setTimeout(() => {
@@ -398,16 +411,18 @@ export default class Controller {
 		switch (event) {
 			case ControllerEvents.SongNowPlaying: {
 				const song = this.getCurrentSong();
+				const run = this.processingRun;
 				if (
 					!song ||
 					song.flags.isReplaying ||
-					!(await this.shouldScrobble()) ||
-					!this.currentSong?.isValid()
+					!song.isValid() ||
+					!(await this.shouldScrobble(song)) ||
+					!this.isCurrentProcessing(song, run)
 				) {
 					break;
 				}
 				const id = await this.tabId;
-				if (!id) {
+				if (!id || !this.isCurrentProcessing(song, run)) {
 					break;
 				}
 
@@ -434,11 +449,16 @@ export default class Controller {
 			}
 			case ControllerEvents.SongUnrecognized: {
 				const song = this.getCurrentSong();
-				if (!song || !(await this.shouldScrobble())) {
+				const run = this.processingRun;
+				if (
+					!song ||
+					!(await this.shouldScrobble(song)) ||
+					!this.isCurrentProcessing(song, run)
+				) {
 					break;
 				}
 				const id = await this.tabId;
-				if (!id) {
+				if (!id || !this.isCurrentProcessing(song, run)) {
 					break;
 				}
 
@@ -487,13 +507,16 @@ export default class Controller {
 	 * Reset song data and process it again.
 	 */
 	public async resetSongData(): Promise<void> {
-		this.assertSongIsPlaying();
+		const song = this.assertSongIsPlaying();
 
-		this.currentSong?.resetInfo();
-		await SavedEdits.removeSongInfo(this.currentSong);
+		song.resetInfo();
+		await SavedEdits.removeSongInfo(song);
+		if (song !== this.currentSong) {
+			return;
+		}
 
-		this.unprocessSong();
-		void this.processSong();
+		this.unprocessSong(song);
+		void this.processSong(song);
 	}
 
 	/**
@@ -556,32 +579,28 @@ export default class Controller {
 	 * @param data - Object containing song data
 	 */
 	async setUserSongData(data: Options.SavedEdit): Promise<void> {
-		this.assertSongIsPlaying();
-		if (!assertSongNotNull(this.currentSong)) {
-			return;
-		}
+		const song = this.assertSongIsPlaying();
 
-		if (this.currentSong.flags.isScrobbled) {
+		if (song.flags.isScrobbled) {
 			throw new Error('Unable to set user data for scrobbled song');
 		}
 
-		await SavedEdits.saveSongInfo(this.currentSong, data);
+		await SavedEdits.saveSongInfo(song, data);
+		if (song !== this.currentSong) {
+			return;
+		}
 
-		this.unprocessSong();
-		void this.processSong();
+		this.unprocessSong(song);
+		void this.processSong(song);
 	}
 
 	/**
 	 * Reprocess currently playing song without otherwise changing it.
 	 */
 	reprocessSong(): void {
-		this.assertSongIsPlaying();
-		if (!assertSongNotNull(this.currentSong)) {
-			return;
-		}
-
-		this.unprocessSong();
-		void this.processSong();
+		const song = this.assertSongIsPlaying();
+		this.unprocessSong(song);
+		void this.processSong(song);
 	}
 
 	/**
@@ -722,10 +741,16 @@ export default class Controller {
 		 * A state counts as a new song when the identity fields changed
 		 * or the current song is replaying.
 		 */
-		const isNewSong = this.isSongChanged(newState) || this.isReplayingSong;
+		const sameTrackId =
+			this.connector.useUniqueIdAsTrackIdentity &&
+			Boolean(newState.uniqueID) &&
+			newState.uniqueID === this.currentSong?.parsed.uniqueID;
+		const isNewSong =
+			this.isReplayingSong ||
+			(!sameTrackId && this.isSongChanged(newState));
 
 		if (!isNewSong) {
-			this.processCurrentState(newState);
+			void this.processCurrentState(newState, sameTrackId);
 		} else if (newState.isPlaying) {
 			this.processNewState(newState);
 		} else {
@@ -860,15 +885,19 @@ export default class Controller {
 			this.setPaused();
 		}
 
-		void this.processSong();
+		void this.processSong(song);
 		this.isReplayingSong = false;
 	}
 
 	/**
 	 * Process connector state as current one.
 	 * @param newState - Connector state
+	 * @param sameTrackId - Whether metadata can be updated in place
 	 */
-	private async processCurrentState(newState: State): Promise<void> {
+	private async processCurrentState(
+		newState: State,
+		sameTrackId: boolean,
+	): Promise<void> {
 		const song = this.currentSong;
 		if (!song || song.flags.isSkipped) {
 			return;
@@ -891,6 +920,14 @@ export default class Controller {
 		song.parsed.trackArt = trackArt;
 		song.parsed.scrobblingDisallowedReason = scrobblingDisallowedReason;
 
+		const metadataChanged =
+			sameTrackId && this.updateTrackMetadata(song, newState);
+		if (metadataChanged) {
+			song.parsed.duration = duration ?? song.parsed.duration;
+			this.unprocessSong(song);
+			void this.processSong(song);
+		}
+
 		if (
 			this.mode === ControllerMode.Disallowed &&
 			scrobblingDisallowedReason &&
@@ -899,13 +936,18 @@ export default class Controller {
 			this.onSongUpdated();
 		}
 
-		if (this.isNeedToUpdateDuration(newState) && duration) {
+		if (
+			!metadataChanged &&
+			this.isNeedToUpdateDuration(newState) &&
+			duration
+		) {
 			this.updateSongDuration(duration);
 		}
 
 		if (isPlayingStateChanged && isPlaying !== void 0) {
 			this.onPlayingStateChanged(isPlaying);
 		} else if (
+			!metadataChanged &&
 			(this.mode === ControllerMode.Disallowed ||
 				this.shouldHaveScrobbled) &&
 			isPlaying &&
@@ -915,6 +957,18 @@ export default class Controller {
 			// this is not necessarily tied to pausing/unpausing
 			void this.setSongNowPlaying(song);
 		}
+	}
+
+	private updateTrackMetadata(song: Song, state: State): boolean {
+		let changed = false;
+		for (const field of trackMetadataFields) {
+			const value = state[field];
+			if (value && value !== song.parsed[field]) {
+				song.parsed[field] = value;
+				changed = true;
+			}
+		}
+		return changed;
 	}
 
 	/**
@@ -934,93 +988,111 @@ export default class Controller {
 	/**
 	 * Process song using pipeline module.
 	 */
-	private async processSong(): Promise<void> {
-		if (!assertSongNotNull(this.currentSong)) {
-			return;
-		}
-		this.shouldHaveScrobbled = false;
-		this.forceScrobble = false;
+	private async processSong(song: Song): Promise<void> {
+		const run = ++this.processingRun;
+		const isCurrent = () => this.isCurrentProcessing(song, run);
 
-		if (await this.shouldScrobble()) {
-			this.setMode(ControllerMode.Loading);
-		} else {
-			this.setMode(ControllerMode.Disallowed);
-		}
-
-		if (
-			!(await this.pipeline.process(
-				this.currentSong,
-				this.connector.meta,
-			))
-		) {
-			return;
-		}
-
-		this.debugLog(
-			`Song finished processing: ${this.currentSong.toString()}`,
-		);
-
-		// Processing cleans this flag
-		this.currentSong.flags.isMarkedAsPlaying = false;
-
-		await this.updateTimers(this.currentSong.getDuration());
-
-		/*
-		 * If the song is playing, mark it immediately;
-		 * otherwise will be flagged in isPlaying binding.
-		 */
-		if (!this.currentSong.isValid()) {
-			this.setSongNotRecognized();
-		} else if (!(await this.shouldScrobble())) {
-			this.setMode(ControllerMode.Disallowed);
-		} else if (this.currentSong.parsed.isPlaying) {
-			/*
-			 * If the song is playing, mark it immediately;
-			 * otherwise will be flagged in isPlaying binding.
-			 */
-			if (!(await this.shouldScrobble())) {
-				this.setMode(ControllerMode.Disallowed);
-			} else if (this.currentSong.parsed.isPlaying) {
-				/*
-					* If playback timer is expired, then the extension
-					* will scrobble song immediately, and there's no need
-					* to set song as now playing. We should dispatch
-					a "now playing" event, though.
-					*/
-				if (!this.playbackTimer.isExpired()) {
-					void this.setSongNowPlaying();
-				} else {
-					this.dispatchEvent(ControllerEvents.SongNowPlaying);
-				}
-			} else {
-				this.setMode(ControllerMode.Base);
+		try {
+			const initiallyAllowed = await this.shouldScrobble(song);
+			if (!isCurrent()) {
+				return;
 			}
-		} else {
-			this.setSongNotRecognized();
-		}
+			if (!song.flags.isScrobbled) {
+				this.setMode(
+					initiallyAllowed
+						? ControllerMode.Loading
+						: ControllerMode.Disallowed,
+				);
+			}
 
-		this.onSongUpdated();
+			const processed = await this.pipeline.process(
+				song,
+				this.connector.meta,
+				isCurrent,
+			);
+			if (!processed || !isCurrent()) {
+				return;
+			}
+
+			this.debugLog(`Song finished processing: ${song.toString()}`);
+			song.flags.isMarkedAsPlaying = false;
+			if (song.flags.isScrobbled) {
+				this.onSongUpdated();
+				return;
+			}
+			if (this.unconfirmedSubmissions.has(song)) {
+				this.setMode(ControllerMode.Err);
+				this.onSongUpdated();
+				return;
+			}
+			await this.updateTimers(song);
+			if (!isCurrent()) {
+				return;
+			}
+
+			const isValid = song.isValid();
+			const allowed = isValid && (await this.shouldScrobble(song));
+			if (!isCurrent()) {
+				return;
+			}
+
+			if (!isValid) {
+				this.setSongNotRecognized();
+			} else if (!allowed) {
+				this.setMode(ControllerMode.Disallowed);
+			} else if (!song.parsed.isPlaying) {
+				this.setMode(ControllerMode.Base);
+			} else if (this.shouldHaveScrobbled) {
+				void this.scrobbleSong(song);
+			} else if (this.playbackTimer.isExpired()) {
+				this.dispatchEvent(ControllerEvents.SongNowPlaying);
+			} else {
+				void this.setSongNowPlaying(song);
+			}
+			this.onSongUpdated();
+		} catch (error) {
+			if (isCurrent()) {
+				this.debugLog(`Song processing failed: ${error}`, 'warn');
+				if (!song.flags.isScrobbled) {
+					this.setMode(ControllerMode.Err);
+				}
+				this.onSongUpdated();
+			}
+		}
+	}
+
+	private isCurrentProcessing(song: Song, run: number): boolean {
+		return (
+			song === this.currentSong &&
+			run === this.processingRun &&
+			!song.flags.isSkipped
+		);
 	}
 
 	/**
 	 * Called when song was already flagged as processed, but now is
 	 * entering the pipeline again.
 	 */
-	private unprocessSong(): void {
-		if (!assertSongNotNull(this.currentSong)) {
-			return;
+	private unprocessSong(song: Song): void {
+		this.debugLog(`Song unprocessed: ${song.toString()}`);
+
+		const { isScrobbled, isReplaying, isLovedInService } = song.flags;
+		const { startTimestamp, userloved, notificationId } = song.metadata;
+		song.resetData();
+		Object.assign(song.flags, {
+			isScrobbled,
+			isReplaying,
+			isLovedInService,
+		});
+		Object.assign(song.metadata, {
+			startTimestamp,
+			userloved,
+			notificationId,
+		});
+
+		if (!isScrobbled && !this.shouldHaveScrobbled) {
+			this.playbackTimer.update(null);
 		}
-
-		this.debugLog(`Song unprocessed: ${this.currentSong.toString()}`);
-		this.debugLog('Clearing playback timer destination time');
-
-		this.currentSong.resetData();
-
-		this.shouldHaveScrobbled = false;
-		this.forceScrobble = false;
-
-		this.playbackTimer.update(null);
-		this.replayDetectionTimer.update(null);
 	}
 
 	/**
@@ -1068,7 +1140,6 @@ export default class Controller {
 			if (
 				field in newState &&
 				field in this.currentSong.parsed &&
-				// @ts-expect-error We check that the fields exist, TS is just being difficult.
 				newState[field] !== this.currentSong.parsed[field]
 			) {
 				return true;
@@ -1095,32 +1166,39 @@ export default class Controller {
 	 * @param duration - Duration in seconds
 	 */
 	private updateSongDuration(duration: number): void {
-		if (!assertSongNotNull(this.currentSong)) {
+		const song = this.currentSong;
+		if (!song) {
 			return;
 		}
 		this.debugLog(`Update duration: ${duration}`);
 
-		this.currentSong.parsed.duration = duration;
+		song.parsed.duration = duration;
 
-		void this.updateTimers(duration);
+		void this.updateTimers(song);
 	}
 
 	/**
 	 * Update internal timers.
-	 * @param duration - Song duration in seconds
+	 * @param song - Play whose duration determines the timer thresholds
 	 */
-	private async updateTimers(
-		duration: number | null | undefined,
-	): Promise<void> {
+	private async updateTimers(song: Song): Promise<void> {
 		if (this.playbackTimer.isExpired()) {
 			this.debugLog('Attempt to update expired timers', 'warn');
 			return;
 		}
 
+		const run = this.processingRun;
 		const rawPercent = await Options.getOption(
 			Options.SCROBBLE_PERCENT,
 			this.connector.meta.id,
 		);
+		if (
+			!this.isCurrentProcessing(song, run) ||
+			this.playbackTimer.isExpired()
+		) {
+			return;
+		}
+		const duration = song.getDuration();
 		const percent = parseScrobblePercent(rawPercent);
 
 		const secondsToScrobble = getSecondsToScrobble(duration, percent);
@@ -1147,15 +1225,16 @@ export default class Controller {
 	 * @param song - Play to mark as now playing
 	 */
 	private async setSongNowPlaying(song = this.currentSong): Promise<void> {
+		const run = this.processingRun;
 		if (
 			!song ||
-			song !== this.currentSong ||
+			!this.isCurrentProcessing(song, run) ||
 			!song.isValid() ||
 			!(await this.shouldScrobble(song)) ||
-			song !== this.currentSong ||
-			song.flags.isSkipped ||
+			!this.isCurrentProcessing(song, run) ||
 			song.flags.isScrobbled ||
-			this.scrobblingSongs.has(song)
+			this.scrobblingSongs.has(song) ||
+			this.unconfirmedSubmissions.has(song)
 		) {
 			return;
 		}
@@ -1188,11 +1267,7 @@ export default class Controller {
 			},
 		});
 
-		if (
-			song !== this.currentSong ||
-			song.flags.isSkipped ||
-			song.flags.isScrobbled
-		) {
+		if (!this.isCurrentProcessing(song, run) || song.flags.isScrobbled) {
 			return;
 		}
 		if (isAnyResult(results, ServiceCallResult.RESULT_OK)) {
@@ -1210,10 +1285,14 @@ export default class Controller {
 		this.playbackTimer.pause();
 		this.replayDetectionTimer.pause();
 
+		const song = this.currentSong;
+		const run = this.processingRun;
 		if (
-			!assertSongNotNull(this.currentSong) ||
-			!this.currentSong.isValid() ||
-			!(await this.shouldScrobble())
+			!song ||
+			!song.isValid() ||
+			!(await this.shouldScrobble(song)) ||
+			!this.isCurrentProcessing(song, run) ||
+			song.parsed.isPlaying
 		) {
 			return;
 		}
@@ -1223,7 +1302,7 @@ export default class Controller {
 		await sendContentMessage({
 			type: 'setPaused',
 			payload: {
-				song: this.currentSong.getCloneableData(),
+				song: song.getCloneableData(),
 			},
 		});
 	}
@@ -1231,10 +1310,14 @@ export default class Controller {
 	private async setResumedPlaying(): Promise<void> {
 		this.isPaused = false;
 
+		const song = this.currentSong;
+		const run = this.processingRun;
 		if (
-			!assertSongNotNull(this.currentSong) ||
-			!this.currentSong.isValid() ||
-			!(await this.shouldScrobble())
+			!song ||
+			!song.isValid() ||
+			!(await this.shouldScrobble(song)) ||
+			!this.isCurrentProcessing(song, run) ||
+			!song.parsed.isPlaying
 		) {
 			return;
 		}
@@ -1243,7 +1326,7 @@ export default class Controller {
 		await sendContentMessage({
 			type: 'setResumedPlaying',
 			payload: {
-				song: this.currentSong.getCloneableData(),
+				song: song.getCloneableData(),
 			},
 		});
 	}
@@ -1294,19 +1377,27 @@ export default class Controller {
 			return false;
 		}
 
-		if (!this.scrobbleCacheIds.has(song)) {
-			const id = await scrobbleCache.pushScrobble({
-				song: song.getCloneableData(),
-				status: allowed
-					? ScrobbleStatus.INVALID
-					: ScrobbleStatus.DISALLOWED,
-			});
-			this.scrobbleCacheIds.set(song, id);
-		}
+		await this.cacheScrobble(
+			song,
+			allowed ? ScrobbleStatus.INVALID : ScrobbleStatus.DISALLOWED,
+		);
 		if (song === this.currentSong && !song.flags.isSkipped) {
 			this.shouldHaveScrobbled = true;
 		}
 		return true;
+	}
+
+	private async cacheScrobble(
+		song: Song,
+		status: ScrobbleStatus,
+	): Promise<void> {
+		if (!this.scrobbleCacheIds.has(song)) {
+			const id = await scrobbleCache.pushScrobble({
+				song: song.getCloneableData(),
+				status,
+			});
+			this.scrobbleCacheIds.set(song, id);
+		}
 	}
 
 	/**
@@ -1321,7 +1412,8 @@ export default class Controller {
 			song !== this.currentSong ||
 			song.flags.isSkipped ||
 			song.flags.isScrobbled ||
-			this.scrobblingSongs.has(song)
+			this.scrobblingSongs.has(song) ||
+			this.unconfirmedSubmissions.has(song)
 		) {
 			return;
 		}
@@ -1393,9 +1485,20 @@ export default class Controller {
 				this.setMode(ControllerMode.Err);
 			}
 		} catch (error) {
+			this.unconfirmedSubmissions.add(song);
 			this.debugLog(`Scrobbling failed: ${error}`, 'warn');
 			if (song === this.currentSong && !song.flags.isSkipped) {
 				this.setMode(ControllerMode.Err);
+			}
+			try {
+				// A lost reply can follow a successful submission. Keep the play
+				// available for manual recovery without resending it automatically.
+				await this.cacheScrobble(song, ScrobbleStatus.ERROR);
+			} catch (cacheError) {
+				this.debugLog(
+					`Unable to cache failed scrobble: ${cacheError}`,
+					'warn',
+				);
 			}
 		} finally {
 			this.scrobblingSongs.delete(song);
@@ -1413,10 +1516,11 @@ export default class Controller {
 	/**
 	 * Assert whether there is a song playing right now
 	 */
-	private assertSongIsPlaying(): void {
+	private assertSongIsPlaying(): Song {
 		if (!this.currentSong) {
 			throw new Error('No song is now playing');
 		}
+		return this.currentSong;
 	}
 
 	/**

@@ -11,7 +11,7 @@
 [![Microsoft Edge Addons][EdgeBadge]][Edge]
 
 [![Discord][DiscordBadge]][Discord]
-[![Test status][GitHubActionsBadge]][GitHubActions]
+[![Upstream test status][GitHubActionsBadge]][GitHubActions]
 [![Codacy Badge][CodacyBadge]][Codacy]
 [![Codacy Coverage Badge][CodacyCoverageBadge]][Codacy]
 [![Crowdin Badge][CrowdinBadge]][Crowdin]
@@ -19,6 +19,16 @@
 </div>
 
 Web Scrobbler helps online music listeners to scrobble their playback history.
+
+## This fork
+
+This fork improves YouTube scrobbling in background tabs and during rapid track
+changes. It retries failed YouTube Music and category lookups and keeps listening
+time tied to the original play when a video's metadata changes.
+
+The packed Opera update is **3.24.0.2**. See the [playback, recovery, and update
+notes](docs/youtube-background-scrobbling.md) for the changes and installation
+steps. The extension-store links below point to the upstream project.
 
 ## Supported Services
 
@@ -36,8 +46,8 @@ The extension can be either downloaded from stores, or installed as an [unpacked
 
 It can be installed directly from the [Chrome Web Store][WebStore] for Chrome users.
 
-Opera users can install the extension from Chrome Web Store using the
-[Download Chrome Extension][DownloadChromeExt] addon for Opera.
+If you already use a packed Opera build of this fork, follow the
+[packed Opera update steps](docs/youtube-background-scrobbling.md#updating-an-existing-packed-opera-installation).
 
 ### Addons.mozilla.org
 
@@ -58,11 +68,9 @@ To install the extension from sources or zip file, read
 [this page][WikiUnpacked] if you're on Chrome, or [this one][WikiTempAddon]
 if you use Firefox.
 
-For local Chrome Web Store and Opera updates, see
-[updating without losing settings or cache](docs/youtube-background-scrobbling.md#updating-a-local-build-in-chrome-or-opera).
 Use **Load unpacked** with the built `build/chrome` folder. The Chromium build
-includes the public key for the Chrome Web Store extension ID, so it can use
-the existing extension's storage.
+uses the Chrome Web Store extension ID. For a local update, follow the
+[instructions for your installed build](docs/youtube-background-scrobbling.md#updating-a-local-build-in-chrome-or-opera).
 
 ## Development
 
@@ -88,19 +96,11 @@ extension. Chromium distribution builds also produce `web-scrobbler-chrome.zip`.
 
 The detailed build instruction is available [here][BuildInstructions].
 
-### YouTube background playback
+### Run regression tests
 
-Version 3.23.2 fixes YouTube videos opened paused in a background tab being saved
-as disallowed scrobbles after playback starts. Playback timing now follows the
-video element, and eligible plays recover after a temporary block clears. See
-the [troubleshooting and verification notes](docs/youtube-background-scrobbling.md).
-
-Version 3.23.3 also fixes missing context menu errors during installation and
-worker startup, and avoids logging an unconfigured ListenBrainz account as a
-storage error. See the [console-message notes](docs/youtube-background-scrobbling.md#console-messages-in-3233).
-
-The notes also cover Opera's [YouTube origin-check messages](docs/youtube-background-scrobbling.md#origin-check-messages-on-youtube),
-which appeared in testing even when the connector and icon loaded successfully.
+Run `npm run test -- --run` and `npm run checkts`. The
+[verification notes](docs/youtube-background-scrobbling.md#verification)
+describe the YouTube playback and recovery cases covered by the tests.
 
 ### Develop connectors
 
@@ -152,10 +152,6 @@ Licensed under the [MIT License][License].
 [Edge]: https://microsoftedge.microsoft.com/addons/detail/web-scrobbler/obiekdelmkmlgnhddmmnpnfhngejbnnc
 [WebStore]: https://chrome.google.com/webstore/detail/lastfm-scrobbler/hhinaapppaileiechjoiifaancjggfjm
 [AppleStore]: https://apps.apple.com/app/web-scrobbler/id6449224218
-
-<!-- Other -->
-
-[DownloadChromeExt]: https://addons.opera.com/extensions/details/app_id/kipjbhgniklcnglfaldilecjomjaddfi
 
 <!-- Related pages -->
 

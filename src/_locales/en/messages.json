@@ -708,8 +708,12 @@
       "description": "The description of 'disallowed' popup."
     },
     "disallowedDescYouTubeMusicLookupFailed": {
-      "message": "Web Scrobbler could not check whether YouTube Music recognizes this video. Reload the page to try again.",
+      "message": "Web Scrobbler could not check whether YouTube Music recognizes this video. It will retry automatically.",
       "description": "The description of 'disallowed' popup when the YouTube Music lookup fails."
+    },
+    "disallowedDescYouTubeCategoryLookupFailed": {
+      "message": "Web Scrobbler could not check this video's YouTube category. It will retry automatically.",
+      "description": "The description of 'disallowed' popup when the YouTube category lookup fails."
     },
     "disallowedDescIsPlayingElsewhere": {
       "message": "The reason is that Web Scrobbler thinks this track is playing elsewhere and should not be scrobbled.",

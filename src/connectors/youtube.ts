@@ -35,23 +35,11 @@ const videoDescriptionSelector = [
 	'.crawler-full-description',
 ];
 
-// Dummy category indicates an actual category is being fetched
-const categoryPending = 'YT_DUMMY_CATEGORY_PENDING';
-// Fallback value in case when we cannot fetch a category.
-const categoryUnknown = 'YT_DUMMY_CATEGORY_UNKNOWN';
-
 const categoryMusic = 'Music';
 const categoryEntertainment = 'Entertainment';
 
-/**
- * Array of categories allowed to be scrobbled.
- */
+/** Categories allowed by the user's settings. */
 const allowedCategories: string[] = [];
-
-/**
- * "Video Id=Category" map.
- */
-const categoryCache = new Map<string, string>();
 
 /**
  * Wether we should only scrobble music recognised by YouTube Music
@@ -67,7 +55,7 @@ let currentVideoDescription: string | null = null;
 let artistTrackFromDescription: TrackInfoWithAlbum | null = null;
 
 type YouTubeMusicLookup =
-	| { status: 'loading' | 'unrecognized' | 'unavailable' }
+	| { status: 'unrecognized' }
 	| { status: 'recognized'; trackInfo?: ArtistTrackInfo };
 
 interface YouTubeMusicPlayerResponse {
@@ -78,9 +66,28 @@ interface YouTubeMusicPlayerResponse {
 	};
 }
 
-const youtubeMusicCache = new Map<string, YouTubeMusicLookup>();
-const youtubeMusicRetryDelayMs = 2_000;
-const youtubeMusicTimeoutMs = 8_000;
+type LookupResult<T> =
+	| { status: 'loading' | 'unavailable' }
+	| { status: 'found'; value: T };
+
+interface LookupEntry<T> {
+	result: LookupResult<T>;
+	retry?: ReturnType<typeof setTimeout>;
+}
+
+const lookupCacheLimit = 128;
+const quickRetryDelayMs = 2_000;
+const recoveryDelayMs = 30_000;
+const maxRecoveryDelayMs = 300_000;
+const lookupTimeoutMs = 8_000;
+const getYouTubeMusicLookup = createVideoLookup(
+	fetchYouTubeMusicLookup,
+	'YouTube Music',
+);
+const getCategoryLookup = createVideoLookup(
+	fetchCategoryName,
+	'YouTube category',
+);
 
 const trackInfoGetters: (() =>
 	| ArtistTrackInfo
@@ -130,14 +137,6 @@ Connector.channelLabelSelector = [
 Connector.getTrackInfo = () => {
 	const trackInfo: TrackInfoWithAlbum = {};
 
-	if (getTrackInfoFromYtMusicEnabled) {
-		const videoId = getVideoId();
-		if (videoId && !youtubeMusicCache.has(videoId)) {
-			getYouTubeMusicLookup(videoId);
-			return trackInfo;
-		}
-	}
-
 	for (const getter of trackInfoGetters) {
 		const currentTrackInfo = getter();
 		if (!currentTrackInfo) {
@@ -184,7 +183,12 @@ Connector.isPlaying = () => {
 	const video = document.querySelector<HTMLVideoElement>(videoSelector);
 	// The player can have playing-mode while background autoplay is paused.
 	return Boolean(
-		video && video.currentTime > 0 && !video.paused && !video.ended,
+		video &&
+			video.currentTime > 0 &&
+			!video.paused &&
+			!video.ended &&
+			!video.seeking &&
+			video.readyState >= 3, // HAVE_FUTURE_DATA
 	);
 };
 
@@ -194,6 +198,7 @@ Connector.getOriginUrl = () => {
 	return `https://youtu.be/${videoId}`;
 };
 
+Connector.useUniqueIdAsTrackIdentity = true;
 Connector.getUniqueID = () => {
 	if (areChaptersAvailable()) {
 		return null;
@@ -206,19 +211,43 @@ Connector.scrobblingDisallowedReason = () => {
 	if (document.querySelector('.ad-showing')) {
 		return 'IsAd';
 	}
+	if (!scrobbleMusicRecognisedOnly && allowedCategories.length === 0) {
+		return null;
+	}
 
+	const videoId = getVideoId();
 	if (scrobbleMusicRecognisedOnly) {
-		switch (getYouTubeMusicLookup(getVideoId()).status) {
-			case 'loading':
-				return 'IsLoading';
-			case 'unavailable':
-				return 'YouTubeMusicLookupFailed';
-			case 'unrecognized':
-				return 'NotOnYouTubeMusic';
+		const result = getYouTubeMusicLookup(videoId);
+		if (result.status === 'loading') {
+			return 'IsLoading';
+		}
+		if (result.status === 'unavailable') {
+			return 'YouTubeMusicLookupFailed';
+		}
+		if (
+			result.status === 'found' &&
+			result.value.status === 'unrecognized'
+		) {
+			return 'NotOnYouTubeMusic';
 		}
 	}
 
-	return isVideoCategoryAllowed() ? null : 'ForbiddenYouTubeCategory';
+	if (allowedCategories.length > 0) {
+		const result = getCategoryLookup(videoId);
+		if (result.status === 'loading') {
+			return 'IsLoading';
+		}
+		if (result.status === 'unavailable') {
+			return 'YouTubeCategoryLookupFailed';
+		}
+		if (
+			result.status === 'found' &&
+			!allowedCategories.includes(result.value)
+		) {
+			return 'ForbiddenYouTubeCategory';
+		}
+	}
+	return null;
 };
 
 Connector.applyFilter(
@@ -230,7 +259,16 @@ Connector.applyFilter(
 
 function setupEventListener() {
 	// Capture media events so this also works for videos created or replaced later.
-	for (const eventName of ['timeupdate', 'play', 'pause', 'ended']) {
+	for (const eventName of [
+		'timeupdate',
+		'play',
+		'playing',
+		'pause',
+		'waiting',
+		'seeking',
+		'seeked',
+		'ended',
+	]) {
 		document.addEventListener(
 			eventName,
 			(event) => {
@@ -299,66 +337,20 @@ function getVideoId() {
 	return videoIDMobile;
 }
 
-function getVideoCategory() {
-	const videoId = getVideoId();
-
-	if (!videoId) {
-		return null;
-	}
-
-	if (categoryCache.has(videoId)) {
-		return categoryCache.get(videoId);
-	}
-
-	/*
-	 * Add dummy category for videoId to prevent
-	 * fetching category multiple times.
-	 */
-	categoryCache.set(videoId, categoryPending);
-
-	fetchCategoryName(videoId)
-		.then((category) => {
-			Util.debugLog(`Fetched category for ${videoId}: ${category}`);
-			categoryCache.set(videoId, category);
-		})
-		.catch((err) => {
-			Util.debugLog(
-				`Failed to fetch category for ${videoId}: ${err}`,
-				'warn',
-			);
-			categoryCache.set(videoId, categoryUnknown);
-		});
-
-	return null;
-}
-
-async function fetchCategoryName(videoId: string) {
-	/*
-	 * We cannot use `location.href`, since it could miss the video URL
-	 * in case when YouTube mini player is visible.
-	 */
+async function fetchCategoryName(videoId: string, signal: AbortSignal) {
+	// The current URL and DOM may point to a different video in the miniplayer.
 	const videoUrl = `${location.origin}/watch?v=${videoId}`;
-
-	try {
-		/*
-		 * Category info is not available via DOM API, so we should search it
-		 * in a page source.
-		 *
-		 * But we cannot use `document.documentElement.outerHtml`, since it
-		 * is not updated on video change.
-		 */
-		const response = await fetch(videoUrl);
-		const rawHtml = await response.text();
-
-		const categoryMatch = rawHtml.match(/"category":"(.+?)"/);
-		if (categoryMatch !== null) {
-			return categoryMatch[1];
-		}
-	} catch {
-		// Do nothing
+	const response = await fetch(videoUrl, { signal });
+	if (!response.ok) {
+		throw new Error(`YouTube returned HTTP ${response.status}`);
 	}
 
-	return categoryUnknown;
+	const rawHtml = await response.text();
+	const category = rawHtml.match(/"category":"(.+?)"/)?.[1];
+	if (!category) {
+		throw new Error('YouTube returned no video category');
+	}
+	return category;
 }
 
 /**
@@ -406,57 +398,91 @@ function getTrackInfoFromYoutubeMusic(): ArtistTrackInfo | undefined {
 	}
 
 	const result = getYouTubeMusicLookup(getVideoId());
-	return result.status === 'recognized' ? result.trackInfo : undefined;
+	if (result.status === 'found' && result.value.status === 'recognized') {
+		return result.value.trackInfo;
+	}
 }
 
-function getYouTubeMusicLookup(videoId: string | null): YouTubeMusicLookup {
+function createVideoLookup<T>(
+	fetchValue: (videoId: string, signal: AbortSignal) => Promise<T>,
+	label: string,
+) {
+	const cache = new Map<string, LookupEntry<T>>();
 	const loading = { status: 'loading' } as const;
-	if (!videoId) {
-		return loading;
-	}
 
-	const cached = youtubeMusicCache.get(videoId);
-	if (cached) {
-		return cached;
-	}
-	youtubeMusicCache.set(videoId, loading);
-	void loadYouTubeMusicLookup(videoId, true);
-	return loading;
-}
-
-async function loadYouTubeMusicLookup(
-	videoId: string,
-	canRetry: boolean,
-): Promise<void> {
-	let result: YouTubeMusicLookup;
-	try {
-		result = await fetchYouTubeMusicLookup(videoId);
-	} catch (error) {
-		Util.debugLog(
-			`Failed to fetch youtube music data for ${videoId}: ${error}`,
-			'warn',
-		);
-		if (canRetry) {
-			setTimeout(() => {
+	async function load(
+		videoId: string,
+		entry: LookupEntry<T>,
+		delayMs: number,
+	) {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), lookupTimeoutMs);
+		try {
+			const value = await fetchValue(videoId, controller.signal);
+			entry.result = { status: 'found', value };
+		} catch (error) {
+			if (cache.get(videoId) !== entry) {
+				return;
+			}
+			Util.debugLog(
+				`${label} lookup failed for ${videoId}: ${error}`,
+				'warn',
+			);
+			const nextDelayMs = Math.min(
+				Math.max(delayMs * 2, recoveryDelayMs),
+				maxRecoveryDelayMs,
+			);
+			entry.retry = setTimeout(() => {
+				entry.retry = undefined;
 				if (getVideoId() === videoId) {
-					void loadYouTubeMusicLookup(videoId, false);
+					void load(videoId, entry, nextDelayMs);
 				} else {
-					youtubeMusicCache.delete(videoId);
+					cache.delete(videoId);
 				}
-			}, youtubeMusicRetryDelayMs);
-			return;
+			}, delayMs);
+			if (
+				delayMs === quickRetryDelayMs ||
+				entry.result.status === 'unavailable'
+			) {
+				return;
+			}
+			entry.result = { status: 'unavailable' };
+		} finally {
+			clearTimeout(timeout);
 		}
-		result = { status: 'unavailable' };
+
+		if (cache.get(videoId) === entry && getVideoId() === videoId) {
+			Connector.onStateChanged();
+		}
 	}
 
-	youtubeMusicCache.set(videoId, result);
-	if (getVideoId() === videoId) {
-		Connector.onStateChanged();
-	}
+	return (videoId: string | null): LookupResult<T> => {
+		if (!videoId) {
+			return loading;
+		}
+		const cached = cache.get(videoId);
+		if (cached) {
+			return cached.result;
+		}
+
+		if (cache.size >= lookupCacheLimit) {
+			const oldest = cache.entries().next();
+			if (!oldest.done) {
+				const [oldId, oldEntry] = oldest.value;
+				clearTimeout(oldEntry.retry);
+				cache.delete(oldId);
+			}
+		}
+		const entry: LookupEntry<T> = { result: loading };
+		cache.set(videoId, entry);
+		void load(videoId, entry, quickRetryDelayMs);
+		return loading;
+	};
 }
 
 async function fetchYouTubeMusicLookup(
 	videoId: string,
+	signal: AbortSignal,
 ): Promise<YouTubeMusicLookup> {
 	const body = JSON.stringify({
 		context: {
@@ -472,46 +498,40 @@ async function fetchYouTubeMusicLookup(
 		videoId,
 	});
 
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), youtubeMusicTimeoutMs);
-	try {
-		const response = await fetch(
-			'https://music.youtube.com/youtubei/v1/player',
-			{
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-				},
-				body,
-				signal: controller.signal,
+	const response = await fetch(
+		'https://music.youtube.com/youtubei/v1/player',
+		{
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
 			},
-		);
-		if (!response.ok) {
-			throw new Error(`YouTube Music returned HTTP ${response.status}`);
-		}
-
-		const { videoDetails } =
-			(await response.json()) as YouTubeMusicPlayerResponse;
-		if (!videoDetails) {
-			throw new Error('YouTube Music returned no video details');
-		}
-		if (!videoDetails.musicVideoType?.startsWith('MUSIC_VIDEO_')) {
-			return { status: 'unrecognized' };
-		}
-		// Other video types can be recognized as music without usable track metadata.
-		if (videoDetails.musicVideoType !== 'MUSIC_VIDEO_TYPE_OMV') {
-			return { status: 'recognized' };
-		}
-		return {
-			status: 'recognized',
-			trackInfo: {
-				artist: videoDetails.author,
-				track: videoDetails.title,
-			},
-		};
-	} finally {
-		clearTimeout(timeout);
+			body,
+			signal,
+		},
+	);
+	if (!response.ok) {
+		throw new Error(`YouTube Music returned HTTP ${response.status}`);
 	}
+
+	const { videoDetails } =
+		(await response.json()) as YouTubeMusicPlayerResponse;
+	if (!videoDetails) {
+		throw new Error('YouTube Music returned no video details');
+	}
+	if (!videoDetails.musicVideoType?.startsWith('MUSIC_VIDEO_')) {
+		return { status: 'unrecognized' };
+	}
+	// Other video types can be recognized as music without usable track metadata.
+	if (videoDetails.musicVideoType !== 'MUSIC_VIDEO_TYPE_OMV') {
+		return { status: 'recognized' };
+	}
+	return {
+		status: 'recognized',
+		trackInfo: {
+			artist: videoDetails.author,
+			track: videoDetails.title,
+		},
+	};
 }
 
 function getTrackInfoFromChapters() {
@@ -564,20 +584,4 @@ function removeNumericPrefix(text: string) {
 		 */
 		{ source: /^\(\d{1,2}\)\./, target: '' },
 	]);
-}
-
-function isVideoCategoryAllowed() {
-	if (allowedCategories.length === 0) {
-		return true;
-	}
-
-	const videoCategory = getVideoCategory();
-	if (!videoCategory) {
-		return false;
-	}
-
-	return (
-		allowedCategories.includes(videoCategory) ||
-		videoCategory === categoryUnknown
-	);
 }

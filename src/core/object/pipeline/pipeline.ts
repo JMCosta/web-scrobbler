@@ -8,11 +8,10 @@ import * as Normalize from '@/core/object/pipeline/normalize';
 import * as RegexEdits from '@/core/object/pipeline/regex-edits';
 import * as CoverArtArchive from '@/core/object/pipeline/coverartarchive/coverartarchive';
 import * as BlockedTags from '@/core/object/pipeline/blocked-tags';
-import type Song from '@/core/object/song';
+import Song from '@/core/object/song';
 import type { ConnectorMeta } from '@/core/connectors';
 
 export default class Pipeline {
-	private song: Song | null = null;
 	private processors = [
 		Copy,
 		Normalize,
@@ -23,28 +22,42 @@ export default class Pipeline {
 		BlockedTags,
 		CoverArtArchive,
 	];
-	constructor() {
-		this.song = null;
-	}
-
-	async process(song: Song, connector: ConnectorMeta): Promise<boolean> {
-		// FIXME: Use another lock way
-		this.song = song;
-		this.song.flags.finishedProcessing = false;
+	async process(
+		song: Song,
+		connector: ConnectorMeta,
+		isCurrent = () => true,
+	): Promise<boolean> {
+		// An in-flight processor may still write to its input after being superseded.
+		// Keep those writes isolated, including when the same play is reprocessed.
+		const draft = new Song(song.parsed, song.connector);
+		draft.metadata.startTimestamp = song.metadata.startTimestamp;
+		song.flags.finishedProcessing = false;
 
 		try {
 			for (const processor of this.processors) {
-				await processor.process(song, connector);
+				await processor.process(draft, connector);
+				if (!isCurrent()) {
+					return false;
+				}
 			}
-			this.song.flags.finishedProcessing = true;
-		} catch (err) {
-			// mark as done even though it errored.
-			this.song.flags.finishedProcessing = true;
-			throw err;
-		}
 
-		// Return false if this call is not relevant, e.g. when
-		// the controller calls `process` with another song.
-		return song.equals(this.song);
+			song.processed = draft.processed;
+			song.noRegex = draft.noRegex;
+			draft.metadata.userloved = song.metadata.userloved;
+			draft.metadata.notificationId = song.metadata.notificationId;
+			song.metadata = draft.metadata;
+			Object.assign(song.flags, {
+				isValid: draft.flags.isValid,
+				isCorrectedByUser: draft.flags.isCorrectedByUser,
+				isRegexEditedByUser: draft.flags.isRegexEditedByUser,
+				isAlbumFetched: draft.flags.isAlbumFetched,
+				hasBlockedTag: draft.flags.hasBlockedTag,
+			});
+			return true;
+		} finally {
+			if (isCurrent()) {
+				song.flags.finishedProcessing = true;
+			}
+		}
 	}
 }

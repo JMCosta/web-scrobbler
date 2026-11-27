@@ -2,6 +2,7 @@ import '#/mocks/webextension-polyfill';
 
 import { expect, it, describe, vi, beforeEach, afterEach } from 'vitest';
 import type Song from '@/core/object/song';
+import type Pipeline from '@/core/object/pipeline/pipeline';
 
 const mocks = vi.hoisted(() => ({
 	sendContentMessage:
@@ -9,7 +10,7 @@ const mocks = vi.hoisted(() => ({
 			(message: { type: string; payload?: unknown }) => Promise<unknown>
 		>(),
 	getOption: vi.fn(),
-	pipelineProcess: vi.fn<(song: Song) => Promise<boolean>>(),
+	pipelineProcess: vi.fn<Pipeline['process']>(),
 	shouldScrobbleChannel: vi.fn<() => Promise<boolean>>(),
 }));
 
@@ -59,6 +60,7 @@ vi.mock('@/core/storage/browser-storage', async (importOriginal) => {
 
 vi.mock('@/core/storage/saved-edits', () => ({
 	default: {
+		loadSongInfo: vi.fn().mockResolvedValue(false),
 		saveSongInfo: vi.fn().mockResolvedValue(undefined),
 		removeSongInfo: vi.fn().mockResolvedValue(undefined),
 	},
@@ -194,6 +196,29 @@ function markValid(song: Song) {
 	return true;
 }
 
+async function mockMetadataLookups(
+	...lookups: { track: string; delay: number }[]
+) {
+	const { default: RealPipeline } = await vi.importActual<
+		typeof import('@/core/object/pipeline/pipeline')
+	>('@/core/object/pipeline/pipeline');
+	const pipeline = new RealPipeline();
+	mocks.pipelineProcess.mockImplementation(pipeline.process.bind(pipeline));
+	mocks.sendContentMessage.mockImplementation(async (message) => {
+		if (message.type !== 'getSongInfo') {
+			return defaultSendContentMessage(message);
+		}
+		const lookup = lookups.shift();
+		if (!lookup) {
+			throw new Error('Unexpected metadata lookup');
+		}
+		if (lookup.delay) {
+			await new Promise((resolve) => setTimeout(resolve, lookup.delay));
+		}
+		return [{ track: lookup.track }];
+	});
+}
+
 describe('onStateChanged', () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
@@ -296,6 +321,111 @@ describe('onStateChanged', () => {
 		expect(controller.getCurrentSong()?.parsed.track).toBe('Judith');
 		expect(controller.getMode()).toBe(ControllerMode.Playing);
 		expect(sentMessages('showNowPlaying')).toHaveLength(2);
+	});
+
+	it('ignores a channel check that completes after a track switch', async () => {
+		const controller = await createController();
+		mocks.shouldScrobbleChannel.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => setTimeout(() => resolve(false), 500)),
+		);
+		mocks.pipelineProcess.mockClear();
+
+		controller.onStateChanged(SONG_STATE);
+		controller.onStateChanged(NEW_SONG_STATE);
+		await settle();
+		expect(controller.getMode()).toBe(ControllerMode.Playing);
+
+		await vi.advanceTimersByTimeAsync(500);
+		expect(mocks.pipelineProcess).toHaveBeenCalledOnce();
+		expect(mocks.pipelineProcess.mock.calls[0][0]).toBe(
+			controller.getCurrentSong(),
+		);
+		expect(sentMessages('setNowPlaying')).toHaveLength(1);
+	});
+
+	it('ignores an earlier metadata result when returning to the same track', async () => {
+		const controller = await createController();
+		const state = {
+			...SONG_STATE,
+			uniqueID: 'first-track',
+			trackArt: 'art',
+		};
+		await mockMetadataLookups(
+			{ track: 'Old result', delay: 500 },
+			{ track: 'Judith', delay: 0 },
+			{ track: 'New result', delay: 1_000 },
+		);
+
+		controller.onStateChanged(state);
+		await settle();
+		controller.onStateChanged({
+			...NEW_SONG_STATE,
+			uniqueID: 'second-track',
+			trackArt: 'art',
+		});
+		await settle();
+		controller.onStateChanged(state);
+		await settle();
+		mocks.sendContentMessage.mockClear();
+
+		await vi.advanceTimersByTimeAsync(500);
+		expect(controller.getMode()).toBe(ControllerMode.Loading);
+		expect(controller.getCurrentSong()?.flags.finishedProcessing).toBe(
+			false,
+		);
+		expect(sentMessages('songUpdate')).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(500);
+		expect(controller.getMode()).toBe(ControllerMode.Playing);
+		expect(controller.getCurrentSong()?.getTrack()).toBe('New result');
+		expect(sentMessages('setNowPlaying')).toHaveLength(1);
+	});
+
+	it('keeps newer metadata when the same play is reprocessed', async () => {
+		const controller = await createController();
+		await mockMetadataLookups(
+			{ track: 'Old result', delay: 1_000 },
+			{ track: 'New result', delay: 0 },
+		);
+
+		controller.onStateChanged({ ...SONG_STATE, trackArt: 'art' });
+		await settle();
+		const song = controller.getCurrentSong();
+		controller.reprocessSong();
+		await settle();
+		expect(song?.getTrack()).toBe('New result');
+
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(controller.getCurrentSong()).toBe(song);
+		expect(song?.getTrack()).toBe('New result');
+		expect(sentMessages('setNowPlaying')).toHaveLength(1);
+	});
+
+	it('keeps the new track’s listening threshold when an old timer update finishes', async () => {
+		const controller = await createController();
+		let firstPercentRead = true;
+		mocks.getOption.mockImplementation((name: string) => {
+			if (name === Options.SCROBBLE_PERCENT && firstPercentRead) {
+				firstPercentRead = false;
+				return new Promise((resolve) =>
+					setTimeout(() => resolve(50), 500),
+				);
+			}
+			return Promise.resolve(50);
+		});
+
+		controller.onStateChanged(SONG_STATE);
+		await settle();
+		controller.onStateChanged(NEW_SONG_STATE);
+		await settle();
+		await vi.advanceTimersByTimeAsync(101_000);
+		expect(sentMessages('scrobble')).toHaveLength(0);
+		expect(sentMessages('setNowPlaying')).toHaveLength(1);
+
+		await vi.advanceTimersByTimeAsync(99_000);
+		expect(sentMessages('scrobble')).toHaveLength(1);
+		expect(controller.getMode()).toBe(ControllerMode.Scrobbled);
 	});
 
 	it('pauses and resumes and scrobbles only after played time', async () => {

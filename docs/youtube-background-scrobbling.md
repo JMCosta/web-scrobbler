@@ -1,4 +1,36 @@
-# YouTube background playback and local updates
+# YouTube playback, recovery, and local updates
+
+## Playback and recovery in 3.24.0.2
+
+-   Background playback starts counting when the video actually advances.
+    Pausing, buffering, and seeking suspend the listening timer.
+-   A metadata correction for the same video preserves its listening time and
+    submitted status. Reprocessing metadata or saving a regex edit also
+    preserves the status of a play already submitted. A replay after the video
+    finishes can scrobble again once it reaches the listening threshold.
+-   A late metadata result from an earlier play cannot update the current
+    video's metadata or timers.
+-   Failed YouTube Music and category lookups retry automatically. After a
+    quick retry, the delay starts at 30 seconds and increases to five minutes
+    between attempts. The video stays blocked while a required lookup is
+    unavailable.
+-   If recognition returns and the same play already reached the listening
+    threshold, it can recover automatically. If the extension loses the
+    background worker's reply to a submission, it keeps the play in the
+    scrobble cache for manual recovery. A lost reply can also follow a
+    successful submission, so check your listening history before resubmitting.
+
+### Resource use
+
+The blocked-tag check reuses one storage wrapper across tracks. The YouTube
+Music and category lookup caches each hold up to 128 video results per tab. A
+revisit after eviction starts a fresh lookup.
+
+In an isolated Chromium comparison with mocked network and storage, the
+upstream build and this fork both made two requests per new video with both
+filters enabled and performed 16 playback state refreshes in eight seconds.
+For 200 blocked-tag checks, the fork reduced recurring timers and storage
+writes from 200 each to one each.
 
 ## Background-tab scrobbling fix in 3.23.2
 
@@ -29,6 +61,8 @@ Clearing a block before the listening threshold does not cause an early scrobble
 
 ## Updating a local build in Chrome or Opera
 
+### Unpacked build using the Chrome Web Store ID
+
 The Chromium build includes the published Chrome Web Store public key. Its
 extension ID is:
 
@@ -36,11 +70,10 @@ extension ID is:
 hhinaapppaileiechjoiifaancjggfjm
 ```
 
-Keeping the same extension ID lets the browser use the original extension's
-local and synced storage, including settings, saved edits, accounts, and the
-scrobble cache. A build with a different ID receives separate storage and can
-look like a fresh installation. This applies to the Chrome Web Store version;
-other stores can use different IDs.
+The browser associates local and synced storage, including settings, saved
+edits, accounts, and the scrobble cache, with the extension ID. The ID above
+applies to the Chrome Web Store build. Other stores and locally packed builds
+can use different IDs.
 
 1. Keep the original extension installed. Uninstalling it can delete its stored
    data. If an earlier local build created a second copy with a different ID,
@@ -48,30 +81,35 @@ other stores can use different IDs.
 2. Run `npm ci`, then `npm run dist chrome` from the source directory.
 3. On the browser's Extensions page, use **Load unpacked** and select
    `build/chrome`, the folder containing the generated `manifest.json`.
-4. Confirm that the loaded extension reports version **3.23.3** and the ID above.
-   Check that the original settings and scrobble cache are visible.
+4. Confirm that the loaded extension reports the version in the generated
+   manifest and the ID above. Check that the settings and scrobble cache are
+   visible.
 5. Refresh any YouTube tabs that were open during the update so they use the
    updated content script.
 
-**Load unpacked** does not require a private signing key. The manifest's `key`
-field is a public identity key, not a private key. See Chrome's documentation on
+**Load unpacked** uses the public identity key in the manifest. See Chrome's documentation on
 [consistent extension IDs][ManifestKey] and [loading unpacked extensions][LoadUnpacked].
 
-### Pack extension reports an existing private key
+### Updating an existing packed Opera installation
 
-The message **A private key for specified extension already exists** means the
-packager is trying to create a signing-key file where one already exists. Keep
-the existing `.pem` file and select it in the packager's **Private key file**
-field when packing `build/chrome` again.
+1. In `opera://extensions`, note the ID and version of the installed packed copy.
+2. Keep the existing copy installed and open the signed `.crx` as an update.
+   The 3.24.0.2 package updates the 3.24.0.1 package when both were signed with
+   the same key.
+3. Confirm the ID matches the existing copy and the version reads **3.24.0.2**.
+   Refresh any open YouTube tabs so they use the updated connector.
 
-Packing a CRX requires a private signing key. A newly generated key does not
-provide the signing identity of the published extension; the public key in the
-manifest does not let a local build sign official store updates.
+For a subsequent local package, build the Chromium extension and prepare a
+copy of `build/chrome`. Set the copy's manifest version to a value
+[higher than the installed version][ManifestVersion] and remove the Chrome
+Web Store `key` field from that copy before packing. In Opera's
+**Pack Extension** dialog, select the built folder and the existing `.pem`
+under **Private key file**. Use that same key for each local update to keep the
+extension ID and its data.
 
-After installing a packed CRX, the browser keeps its own copy of the extension,
-so the unpacked build folder is no longer needed for that installation. Keep the
-CRX for installation and keep the `.pem` private and backed up for signing future
-updates. An unpacked installation still needs its build folder.
+If Opera reports **A private key for specified extension already exists**,
+select the existing key in the dialog. Store the `.pem` privately and share
+only the signed `.crx`.
 
 ## Console messages in 3.23.3
 
@@ -87,11 +125,6 @@ Accounts page checks a ListenBrainz account that has never been connected.
 An absent account record is now treated as signed out without error logging or
 unnecessary sign-out writes. This does not sign the account in or restore data
 from another extension ID. Actual storage failures still propagate.
-
-For a packed 3.23.2 installation, create the 3.23.3 CRX with the same private
-signing key and install it as an update. Its ID must match the installed packed
-copy. The original store ID and the locally signed CRX ID can differ, as described
-above; do not generate a new key for a routine update.
 
 ### Origin-check messages on YouTube
 
@@ -130,10 +163,11 @@ npm run lint
 npm run dist chrome
 ```
 
-Regression tests cover background playback detection, paused listening time,
-temporary blocks clearing before and after the threshold, recovery on resume,
-existing restrictions, manual recovery, duplicate playback updates, and the
-Chromium extension ID derived from the public key.
+Regression tests cover starting YouTube playback in a background tab,
+switching tabs just after playback starts, buffering and seeking, recovery
+from failed lookups, rapid switches, and replays. They also verify listening
+time across metadata corrections, caching when a submission reply is lost,
+and reuse of the blocked-tag storage timer.
 
 Additional tests cover asynchronous menu creation, simultaneous startup and tab
 updates, worker restarts, menu API failures, and unconfigured ListenBrainz
@@ -153,5 +187,6 @@ the 3.23.2 build. Automated tests use simulated browser and service responses;
 they do not submit test plays to a live Last.fm account.
 
 [ManifestKey]: https://developer.chrome.com/docs/extensions/reference/manifest/key
+[ManifestVersion]: https://developer.chrome.com/docs/extensions/reference/manifest/version
 [LoadUnpacked]: https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#load-unpacked
 [WebAccessibleResources]: https://developer.chrome.com/docs/extensions/reference/manifest/web-accessible-resources

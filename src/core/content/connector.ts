@@ -334,6 +334,9 @@ export default class BaseConnector {
 	 */
 	public getUniqueID: () => string | null | undefined = () => null;
 
+	/** Whether a stable track ID distinguishes new tracks from metadata updates. */
+	public useUniqueIdAsTrackIdentity = false;
+
 	/**
 	 * Default implementation of check for active playback by play/pause button
 	 * selector. The state of playback allows the core to detect pauses.

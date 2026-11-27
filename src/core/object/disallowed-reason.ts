@@ -33,6 +33,9 @@ export type DisallowedReason =
 	 */
 	| 'YouTubeMusicLookupFailed'
 
+	/** The video's YouTube category could not be checked. */
+	| 'YouTubeCategoryLookupFailed'
+
 	/**
 	 * Web scrobbler thinks this song is playing on a different device
 	 */

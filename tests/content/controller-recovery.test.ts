@@ -107,6 +107,7 @@ describe('Controller playback and scrobble recovery', () => {
 			{
 				meta: { id: 'YouTube', label: 'YouTube' },
 				getChannelId: () => null,
+				useUniqueIdAsTrackIdentity: true,
 			} as unknown as BaseConnector,
 			true,
 		);
@@ -146,6 +147,94 @@ describe('Controller playback and scrobble recovery', () => {
 		await vi.advanceTimersByTimeAsync(1_000);
 		expect(scrobbleRequests()).toHaveLength(1);
 	});
+
+	it.each([
+		{ scenario: 'starts in a background tab', initiallyHidden: true },
+		{
+			scenario: 'moves to the background immediately',
+			initiallyHidden: false,
+		},
+	])(
+		'excludes buffering and seek time when YouTube $scenario',
+		async ({ initiallyHidden }) => {
+			vi.resetModules();
+			let hidden = initiallyHidden;
+			const video = {
+				currentTime: 0,
+				paused: false,
+				ended: false,
+				readyState: 4,
+				seeking: false,
+				matches: (selector: string) => selector === '.html5-main-video',
+			};
+			const mediaListeners = new Map<
+				string,
+				(event: { target: typeof video }) => void
+			>();
+			const youtube = {
+				applyFilter: vi.fn(),
+				onStateChanged: () => {
+					controller.onStateChanged({
+						...state,
+						currentTime: video.currentTime,
+						isPlaying: youtube.isPlaying(),
+					});
+				},
+			} as unknown as BaseConnector;
+			vi.stubGlobal('document', {
+				get hidden() {
+					return hidden;
+				},
+				get visibilityState() {
+					return hidden ? 'hidden' : 'visible';
+				},
+				querySelector: (selector: string) =>
+					video.matches(selector) ? video : null,
+				addEventListener: (
+					name: string,
+					listener: (event: { target: typeof video }) => void,
+				) => mediaListeners.set(name, listener),
+			});
+			vi.stubGlobal('Connector', youtube);
+			vi.stubGlobal('Util', {
+				getOption: async () => false,
+				debugLog: vi.fn(),
+			});
+			vi.stubGlobal('MetadataFilter', {
+				createYouTubeFilter: () => ({ append: vi.fn() }),
+			});
+			await import('@/connectors/youtube');
+
+			const dispatch = (name: string) =>
+				mediaListeners.get(name)!({ target: video });
+			dispatch('play');
+			expect(controller.getCurrentSong()).toBeNull();
+			video.currentTime = 0.5;
+			dispatch('timeupdate');
+			hidden = true;
+
+			await vi.advanceTimersByTimeAsync(10_000);
+			video.currentTime = 10;
+			video.readyState = 2;
+			dispatch('waiting');
+			await vi.advanceTimersByTimeAsync(80_000);
+			expect(scrobbleRequests()).toHaveLength(0);
+
+			video.readyState = 4;
+			video.seeking = true;
+			dispatch('seeking');
+			await vi.advanceTimersByTimeAsync(5_000);
+			video.currentTime = 35;
+			video.seeking = false;
+			dispatch('seeked');
+			await vi.advanceTimersByTimeAsync(49_999);
+			expect(scrobbleRequests()).toHaveLength(0);
+
+			await vi.advanceTimersByTimeAsync(1);
+			expect(scrobbleRequests()).toHaveLength(1);
+			expect(controller.getMode()).toBe(ControllerMode.Scrobbled);
+		},
+	);
 
 	it('keeps the listening threshold when a temporary block clears early', async () => {
 		await update({ scrobblingDisallowedReason: 'IsLoading' });
@@ -359,7 +448,123 @@ describe('Controller playback and scrobble recovery', () => {
 		await update({ scrobblingDisallowedReason: null });
 
 		expect(scrobbleRequests()).toHaveLength(1);
+		expect(mocks.pushScrobble).toHaveBeenCalledOnce();
 		expect(mocks.deleteScrobbles).not.toHaveBeenCalled();
 		expect(controller.getMode()).toBe(ControllerMode.Err);
+	});
+
+	it('recovers a play whose title changes when recognition returns', async () => {
+		await update({ scrobblingDisallowedReason: 'IsLoading' });
+		const song = controller.getCurrentSong();
+		await vi.advanceTimersByTimeAsync(92_000);
+		expect(mocks.pushScrobble).toHaveBeenCalledOnce();
+
+		await update({
+			track: 'Canonical title',
+			scrobblingDisallowedReason: null,
+			currentTime: 92,
+		});
+
+		expect(controller.getCurrentSong()).toBe(song);
+		expect(scrobbleRequests()).toHaveLength(1);
+		const submitted = scrobbleRequests()[0][0].payload.songs[0];
+		expect(submitted.parsed.track).toBe('Canonical title');
+		expect(submitted.metadata.startTimestamp).toBe(0);
+		expect(mocks.deleteScrobbles).toHaveBeenCalledExactlyOnceWith([1]);
+	});
+
+	it('counts listening time from before a title correction', async () => {
+		await update();
+		const song = controller.getCurrentSong();
+		await vi.advanceTimersByTimeAsync(40_000);
+		await update({ track: 'Corrected title', currentTime: 40 });
+		await vi.advanceTimersByTimeAsync(19_999);
+		expect(scrobbleRequests()).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(controller.getCurrentSong()).toBe(song);
+		expect(scrobbleRequests()).toHaveLength(1);
+		expect(scrobbleRequests()[0][0].payload.songs[0].parsed.track).toBe(
+			'Corrected title',
+		);
+	});
+
+	it('keeps a completed play scrobbled after reprocessing and counts a real replay', async () => {
+		await update({ duration: 900 });
+		await vi.advanceTimersByTimeAsync(240_000);
+		const song = controller.getCurrentSong();
+		expect(scrobbleRequests()).toHaveLength(1);
+
+		await update({ track: 'Corrected title', currentTime: 240 });
+		mocks.listeners.get('reprocessSong')!();
+		await vi.advanceTimersByTimeAsync(241_000);
+
+		expect(controller.getCurrentSong()).toBe(song);
+		expect(controller.getCurrentSong()?.parsed.track).toBe(
+			'Corrected title',
+		);
+		expect(controller.getMode()).toBe(ControllerMode.Scrobbled);
+		expect(scrobbleRequests()).toHaveLength(1);
+
+		await vi.advanceTimersByTimeAsync(419_000);
+		await update({ isPlaying: false, currentTime: 900 });
+		await update({ isPlaying: true, currentTime: 1 });
+		await vi.advanceTimersByTimeAsync(240_000);
+		expect(scrobbleRequests()).toHaveLength(2);
+		expect(controller.getCurrentSong()).not.toBe(song);
+	});
+
+	it('caches an unconfirmed first submission and keeps it available for manual recovery', async () => {
+		mocks.sendContentMessage.mockImplementation(async ({ type }) => {
+			if (type === 'scrobble') {
+				throw new Error('Message channel disconnected');
+			}
+			return [ServiceCallResult.RESULT_OK];
+		});
+		await update();
+		await vi.advanceTimersByTimeAsync(61_000);
+		expect(mocks.pushScrobble).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ status: 'error' }),
+		);
+
+		await update({ currentTime: 61, track: 'Corrected title' });
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(controller.getMode()).toBe(ControllerMode.Err);
+		expect(scrobbleRequests()).toHaveLength(1);
+		expect(mocks.deleteScrobbles).not.toHaveBeenCalled();
+	});
+
+	it('caches the original play when its submission fails after switching videos', async () => {
+		let rejectSubmission!: (error: Error) => void;
+		mocks.sendContentMessage.mockImplementation(async ({ type }) => {
+			if (type === 'scrobble') {
+				return new Promise<never>((_, reject) => {
+					rejectSubmission = reject;
+				});
+			}
+			return [ServiceCallResult.RESULT_OK];
+		});
+		await update();
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(scrobbleRequests()).toHaveLength(1);
+
+		await update({
+			track: 'Next track',
+			uniqueID: 'next-video',
+			currentTime: 1,
+		});
+		rejectSubmission(new Error('Background reply was lost'));
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(mocks.pushScrobble).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				status: 'error',
+				song: expect.objectContaining({
+					parsed: expect.objectContaining({ uniqueID: 'video' }),
+				}),
+			}),
+		);
+		expect(controller.getCurrentSong()?.parsed.uniqueID).toBe('next-video');
+		expect(controller.getMode()).toBe(ControllerMode.Playing);
 	});
 });

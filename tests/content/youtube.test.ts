@@ -7,6 +7,8 @@ describe('YouTube playback detection', () => {
 		currentTime: number;
 		paused: boolean;
 		ended: boolean;
+		readyState: number;
+		seeking: boolean;
 		matches: (selector: string) => boolean;
 		addEventListener: ReturnType<typeof vi.fn>;
 	} | null;
@@ -21,6 +23,8 @@ describe('YouTube playback detection', () => {
 			currentTime: 0,
 			paused: true,
 			ended: false,
+			readyState: 4,
+			seeking: false,
 			matches: (selector) => selector === '.html5-main-video',
 			addEventListener: vi.fn(),
 		};
@@ -76,7 +80,25 @@ describe('YouTube playback detection', () => {
 		expect(connector.isPlaying()).toBe(false);
 	});
 
-	it.each(['timeupdate', 'play', 'pause', 'ended'])(
+	it('only counts playback while the video has enough data and is not seeking', () => {
+		Object.assign(video!, { currentTime: 1, paused: false, readyState: 2 });
+		expect(connector.isPlaying()).toBe(false);
+		Object.assign(video!, { readyState: 4, seeking: true });
+		expect(connector.isPlaying()).toBe(false);
+		Object.assign(video!, { seeking: false });
+		expect(connector.isPlaying()).toBe(true);
+	});
+
+	it.each([
+		'timeupdate',
+		'play',
+		'playing',
+		'pause',
+		'waiting',
+		'seeking',
+		'seeked',
+		'ended',
+	])(
 		'updates playback on %s even when YouTube replaces the video',
 		(eventName) => {
 			const registration = documentMock.addEventListener.mock.calls.find(
@@ -186,6 +208,92 @@ describe('YouTube Music recognition on YouTube', () => {
 		expect(request).toHaveBeenCalledTimes(2);
 	});
 
+	it('automatically recovers the current video after both attempts fail', async () => {
+		request
+			.mockRejectedValueOnce(new TypeError('Network failed'))
+			.mockResolvedValueOnce(new Response(null, { status: 503 }))
+			.mockImplementationOnce(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 1_000));
+				return Response.json(recognized);
+			});
+
+		expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+		await vi.advanceTimersByTimeAsync(2_000);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'YouTubeMusicLookupFailed',
+		);
+		expect(connector.onStateChanged).toHaveBeenCalledOnce();
+
+		await vi.advanceTimersByTimeAsync(29_999);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'YouTubeMusicLookupFailed',
+		);
+		expect(request).toHaveBeenCalledTimes(2);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'YouTubeMusicLookupFailed',
+		);
+		expect(request).toHaveBeenCalledTimes(3);
+
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(connector.scrobblingDisallowedReason()).toBeNull();
+		expect(connector.onStateChanged).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(300_000);
+		expect(request).toHaveBeenCalledTimes(3);
+	});
+
+	it('backs off during an outage and caches a definitive unrecognized result', async () => {
+		request.mockRejectedValue(new TypeError('Network failed'));
+
+		expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+		await vi.advanceTimersByTimeAsync(32_000);
+		expect(request).toHaveBeenCalledTimes(3);
+		await vi.advanceTimersByTimeAsync(59_999);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'YouTubeMusicLookupFailed',
+		);
+		expect(request).toHaveBeenCalledTimes(3);
+		expect(connector.onStateChanged).toHaveBeenCalledOnce();
+
+		request.mockResolvedValueOnce(Response.json({ videoDetails: {} }));
+		await vi.advanceTimersByTimeAsync(1);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'NotOnYouTubeMusic',
+		);
+		await vi.advanceTimersByTimeAsync(300_000);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'NotOnYouTubeMusic',
+		);
+		expect(request).toHaveBeenCalledTimes(4);
+	});
+
+	it('expires a failed lookup without fetching after switching videos', async () => {
+		request
+			.mockRejectedValueOnce(new TypeError('Network failed'))
+			.mockRejectedValueOnce(new TypeError('Network failed'))
+			.mockImplementation(async () => Response.json(recognized));
+
+		expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+		await vi.advanceTimersByTimeAsync(2_000);
+		expect(connector.scrobblingDisallowedReason()).toBe(
+			'YouTubeMusicLookupFailed',
+		);
+
+		videoId = 'video-two';
+		expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(connector.scrobblingDisallowedReason()).toBeNull();
+		expect(request).toHaveBeenCalledTimes(3);
+		expect(connector.onStateChanged).toHaveBeenCalledTimes(2);
+
+		videoId = 'video-one';
+		expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+		await vi.advanceTimersByTimeAsync(0);
+		expect(connector.scrobblingDisallowedReason()).toBeNull();
+		expect(request).toHaveBeenCalledTimes(4);
+	});
+
 	it('cancels a stalled request before retrying', async () => {
 		request
 			.mockImplementationOnce(
@@ -239,5 +347,53 @@ describe('YouTube Music recognition on YouTube', () => {
 
 		expect(connector.scrobblingDisallowedReason()).toBeNull();
 		expect(request).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([
+		['Music', null],
+		['Gaming', 'ForbiddenYouTubeCategory'],
+	])(
+		'keeps the Music category filter active while recovering a %s result',
+		async (category, reason) => {
+			vi.resetModules();
+			vi.stubGlobal('location', { origin: 'https://www.youtube.com' });
+			vi.mocked(Util.getOption).mockImplementation(
+				async (_connector, key) => key === 'scrobbleMusicOnly',
+			);
+			await import('@/connectors/youtube');
+			await vi.advanceTimersByTimeAsync(0);
+			request
+				.mockRejectedValueOnce(new TypeError('Network failed'))
+				.mockResolvedValueOnce(new Response(null, { status: 503 }))
+				.mockResolvedValueOnce(
+					new Response(JSON.stringify({ category })),
+				);
+
+			expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+			await vi.advanceTimersByTimeAsync(2_000);
+			expect(connector.scrobblingDisallowedReason()).toBe(
+				'YouTubeCategoryLookupFailed',
+			);
+			await vi.advanceTimersByTimeAsync(29_999);
+			expect(request).toHaveBeenCalledTimes(2);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(connector.scrobblingDisallowedReason()).toBe(reason);
+			expect(request).toHaveBeenCalledTimes(3);
+		},
+	);
+
+	it('evicts older results from the long-lived lookup cache', async () => {
+		request.mockImplementation(async () => Response.json(recognized));
+		for (let id = 0; id <= 128; id++) {
+			videoId = `video-${id}`;
+			expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+			await vi.advanceTimersByTimeAsync(0);
+		}
+		expect(request).toHaveBeenCalledTimes(129);
+		videoId = 'video-128';
+		expect(connector.scrobblingDisallowedReason()).toBeNull();
+		videoId = 'video-0';
+		expect(connector.scrobblingDisallowedReason()).toBe('IsLoading');
+		expect(request).toHaveBeenCalledTimes(130);
 	});
 });
